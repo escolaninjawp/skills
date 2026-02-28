@@ -1,0 +1,913 @@
+# Skill: Comunidade IA com SEO para Django
+
+## O que esta skill faz
+
+Implementa um módulo de comunidade estilo fórum (perguntas e respostas) **totalmente gerado por IA (GPT-4o-mini por padrão)**, focado em SEO. Publica N perguntas/dia automaticamente via Celery Beat, cada uma com várias respostas humanizadas com personas diferentes. Avatares gerados automaticamente pelo DiceBear (iniciais do nome). Schema.org completo, sitemap XML, canonical URLs.
+
+**Casos de uso:** Blog de conteúdo SEO, comunidade de nicho, FAQ dinâmico, tráfego orgânico do Google.
+
+---
+
+## Pré-requisitos
+
+```
+django >= 4.2
+openai >= 1.12
+celery >= 5.3
+django-celery-beat >= 2.5   # opcional, para agendamento via banco
+django-solo >= 2.0           # singleton de configuração
+```
+
+Em `INSTALLED_APPS` adicionar:
+```python
+'django.contrib.sitemaps',
+'apps.community',
+```
+
+---
+
+## Estrutura de Arquivos
+
+```
+apps/community/
+├── __init__.py
+├── apps.py
+├── models.py
+├── views.py
+├── urls.py
+├── admin_urls.py
+├── admin_views.py
+├── admin.py
+├── sitemaps.py
+├── tasks.py
+├── services/
+│   ├── __init__.py
+│   └── generator.py
+└── management/commands/
+    ├── seed_community_categories.py
+    └── generate_community.py
+
+templates/community/
+├── home.html
+├── category.html
+├── question.html
+└── admin/dashboard.html
+```
+
+---
+
+## 1. Models (`apps/community/models.py`)
+
+```python
+from django.db import models
+from django.utils.text import slugify
+
+
+class CommunityConfig(models.Model):
+    """Singleton de configuração da comunidade."""
+    openai_api_key      = models.CharField('OpenAI API Key', max_length=255, blank=True)
+    openai_model        = models.CharField('Modelo', max_length=50, default='gpt-4o-mini',
+                            choices=[('gpt-4o-mini','GPT-4o Mini (Padrão — Barato)'),('gpt-4o','GPT-4o (Premium)')])
+    questions_per_day   = models.IntegerField('Perguntas por dia', default=20)
+    answers_min         = models.IntegerField('Mín. respostas', default=6)
+    answers_max         = models.IntegerField('Máx. respostas', default=12)
+    generation_enabled  = models.BooleanField('Geração ativa', default=True)
+    generation_hour     = models.IntegerField('Hora UTC do cron', default=8)
+    last_generated_at   = models.DateTimeField(null=True, blank=True)
+    created_at          = models.DateTimeField(auto_now_add=True)
+    updated_at          = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = 'Configuração da Comunidade'
+
+    def __str__(self):
+        return 'Configurações da Comunidade'
+
+    @classmethod
+    def get_solo(cls):
+        obj, _ = cls.objects.get_or_create(pk=1)
+        return obj
+
+
+class CommunityCategory(models.Model):
+    """Categorias temáticas da comunidade."""
+    name            = models.CharField('Nome', max_length=100)
+    slug            = models.SlugField(unique=True)
+    description     = models.TextField('Descrição', blank=True)
+    icon            = models.CharField('Ícone Lucide', max_length=50, default='message-circle')
+    color           = models.CharField('Cor hex', max_length=7, default='#6366f1')
+    seo_title       = models.CharField(max_length=60, blank=True)
+    seo_description = models.CharField(max_length=160, blank=True)
+    order           = models.IntegerField(default=0)
+    is_active       = models.BooleanField(default=True)
+    created_at      = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['order', 'name']
+
+    def __str__(self):
+        return self.name
+
+    # IMPORTANTE: não criar @property question_count aqui pois conflita com ORM annotation
+
+
+class CommunityQuestion(models.Model):
+    """Pergunta gerada por IA."""
+    category        = models.ForeignKey(CommunityCategory, on_delete=models.CASCADE,
+                        related_name='questions')
+    title           = models.CharField(max_length=300)
+    slug            = models.SlugField(max_length=320, unique=True)
+    body            = models.TextField('Corpo')
+    author_name     = models.CharField(max_length=100)   # nome humano gerado pela IA
+    author_avatar   = models.CharField(max_length=80, blank=True)  # seed DiceBear
+    seo_title       = models.CharField(max_length=80, blank=True)
+    seo_description = models.CharField(max_length=200, blank=True)
+    views           = models.IntegerField(default=0)
+    answer_count    = models.IntegerField(default=0)     # cache
+    is_published    = models.BooleanField(default=True)
+    created_at      = models.DateTimeField(auto_now_add=True)
+    updated_at      = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['category', 'is_published']),
+            models.Index(fields=['slug']),
+        ]
+
+    def __str__(self):
+        return self.title
+
+    def save(self, *args, **kwargs):
+        if not self.slug:
+            base = slugify(self.title)[:300]
+            slug, n = base, 1
+            while CommunityQuestion.objects.filter(slug=slug).exclude(pk=self.pk).exists():
+                slug = f'{base}-{n}'; n += 1
+            self.slug = slug
+        super().save(*args, **kwargs)
+
+
+class CommunityAnswer(models.Model):
+    """Resposta gerada por IA com persona humana."""
+    question        = models.ForeignKey(CommunityQuestion, on_delete=models.CASCADE,
+                        related_name='answers')
+    body            = models.TextField()
+    author_name     = models.CharField(max_length=100)
+    author_avatar   = models.CharField(max_length=80, blank=True)  # seed DiceBear
+    upvotes         = models.IntegerField(default=0)
+    is_accepted     = models.BooleanField(default=False)
+    order           = models.IntegerField(default=0)
+    created_at      = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-is_accepted', 'order', '-upvotes']
+
+    def __str__(self):
+        return f'{self.author_name} → {self.question.title[:50]}'
+```
+
+---
+
+## 2. Serviço de Geração IA (`apps/community/services/generator.py`)
+
+```python
+import json
+import random
+import re
+from datetime import date, timedelta
+
+from django.utils import timezone
+
+from apps.community.models import CommunityConfig, CommunityCategory, CommunityQuestion, CommunityAnswer
+
+
+def _get_openai_client(api_key: str):
+    from openai import OpenAI
+    return OpenAI(api_key=api_key)
+
+
+def _resolve_api_key(config) -> str:
+    """Busca a chave OpenAI: config > tenant vitoria-demo > settings."""
+    key = config.openai_api_key
+    if not key:
+        try:
+            from apps.tenants.models import TenantSettings
+            ts = TenantSettings.objects.filter(tenant__slug='vitoria-demo').first()
+            if ts and ts.openai_api_key:
+                key = ts.openai_api_key
+        except Exception:
+            pass
+    if not key:
+        from django.conf import settings as ds
+        key = getattr(ds, 'OPENAI_API_KEY', '')
+    return key
+
+
+def _distribute_questions(categories, total: int) -> list[tuple]:
+    """Distribui perguntas pelas categorias priorizando as com menos conteúdo."""
+    cats = list(categories)
+    if not cats:
+        return []
+    counts = {c.pk: CommunityQuestion.objects.filter(category=c, is_published=True).count() for c in cats}
+    cats.sort(key=lambda c: counts[c.pk])
+    distribution = []
+    for i, cat in enumerate(cats):
+        n = total // len(cats) + (1 if i < total % len(cats) else 0)
+        if n > 0:
+            distribution.append((cat, n))
+    return distribution
+
+
+def _ask_question(client, model: str, category, existing_titles: list[str]) -> dict:
+    existing = '\n'.join(f'- {t}' for t in existing_titles[-20:]) if existing_titles else 'Nenhuma ainda.'
+    prompt = f"""Você é especialista em SEO e conteúdo para o mercado brasileiro de joias, semi-joias e galvânica.
+
+Gere UMA pergunta realista de fórum feita por um profissional brasileiro (joalheiro, revendedor, galvanicador ou empreendedor) sobre a categoria: **{category.name}**
+
+Categoria descrição: {category.description}
+
+Perguntas já existentes (evite repetir):
+{existing}
+
+REGRAS:
+- Título entre 40-100 caracteres, tom natural como pergunta real de fórum
+- Corpo: 1-2 parágrafos de contexto explicando o problema/situação
+- seo_title: versão SEO do título (max 60 chars), inclua palavras-chave
+- seo_description: resumo para Google (max 160 chars)
+- author_name: nome brasileiro completo realista (ex: "Maria Santos", "Carlos Oliveira")
+- author_avatar: apenas o PRIMEIRO NOME em minúsculas sem acento (ex: "maria", "carlos") — usado como seed do avatar
+
+Responda SOMENTE com JSON válido:
+{{
+  "title": "...",
+  "body": "...",
+  "seo_title": "...",
+  "seo_description": "...",
+  "author_name": "...",
+  "author_avatar": "..."
+}}"""
+
+    resp = client.chat.completions.create(
+        model=model,
+        messages=[{'role': 'user', 'content': prompt}],
+        temperature=0.85,
+        max_tokens=600,
+        response_format={'type': 'json_object'},
+    )
+    return json.loads(resp.choices[0].message.content)
+
+
+def _ask_answers(client, model: str, question_title: str, question_body: str,
+                 answers_min: int, answers_max: int) -> list[dict]:
+    n = random.randint(answers_min, answers_max)
+    prompt = f"""Você é moderador de um fórum brasileiro de joias, semi-joias e galvânica.
+
+Gere {n} respostas DIFERENTES para a pergunta abaixo. Cada resposta deve ter uma persona distinta:
+- Iniciante curioso (1-2 anos no ramo)
+- Experiente veterano (10+ anos)
+- Revendedor do interior
+- Dona de ateliê/loja
+- Galvanicador técnico
+- Fornecedor
+(use as personas disponíveis variando entre as {n} respostas)
+
+PERGUNTA: {question_title}
+CONTEXTO: {question_body}
+
+REGRAS:
+- Tom conversacional, como fórum real — não formal demais
+- Respostas entre 80-250 palavras cada
+- Primeira resposta: is_accepted=true (a melhor resposta)
+- Demais: is_accepted=false
+- upvotes: número realista entre 0-47
+- author_name: nome brasileiro completo realista
+- author_avatar: apenas o PRIMEIRO NOME em minúsculas sem acento (ex: "ana", "joao") — seed do avatar
+- Datas espalhadas nos últimos 30 dias (apenas inclua no JSON, não precisa de data)
+
+Responda SOMENTE com JSON array válido:
+[
+  {{
+    "author_name": "...",
+    "author_avatar": "...",
+    "body": "...",
+    "upvotes": 0,
+    "is_accepted": true,
+    "order": 0
+  }},
+  ...
+]"""
+
+    resp = client.chat.completions.create(
+        model=model,
+        messages=[{'role': 'user', 'content': prompt}],
+        temperature=0.9,
+        max_tokens=3000,
+    )
+    raw = resp.choices[0].message.content.strip()
+    # extrai array JSON do texto
+    match = re.search(r'\[.*\]', raw, re.DOTALL)
+    if match:
+        raw = match.group(0)
+    return json.loads(raw)
+
+
+def generate_daily_content(count: int = None) -> dict:
+    config = CommunityConfig.get_solo()
+    if not config.generation_enabled:
+        return {'error': 'Geração desativada nas configurações.'}
+
+    api_key = _resolve_api_key(config)
+    if not api_key or api_key.startswith('sk-your'):
+        return {'error': 'API key OpenAI não configurada.'}
+
+    total = count or config.questions_per_day
+    categories = CommunityCategory.objects.filter(is_active=True)
+    if not categories.exists():
+        return {'error': 'Nenhuma categoria ativa cadastrada.'}
+
+    client = _get_openai_client(api_key)
+    model = config.openai_model
+    generated, errors = 0, 0
+    questions_data = []
+    existing_titles = list(
+        CommunityQuestion.objects.filter(is_published=True)
+        .order_by('-created_at')
+        .values_list('title', flat=True)[:50]
+    )
+
+    for category, n_questions in _distribute_questions(categories, total):
+        for _ in range(n_questions):
+            try:
+                q_data = _ask_question(client, model, category, existing_titles)
+                question = CommunityQuestion.objects.create(
+                    category=category,
+                    title=q_data['title'],
+                    body=q_data.get('body', ''),
+                    author_name=q_data.get('author_name', 'Usuário'),
+                    author_avatar=q_data.get('author_avatar', 'user'),
+                    seo_title=q_data.get('seo_title', '')[:80],
+                    seo_description=q_data.get('seo_description', '')[:200],
+                )
+                existing_titles.append(q_data['title'])
+
+                answers_data = _ask_answers(
+                    client, model, question.title, question.body,
+                    config.answers_min, config.answers_max,
+                )
+                answer_objs = []
+                for i, a in enumerate(answers_data):
+                    answer_objs.append(CommunityAnswer(
+                        question=question,
+                        body=a.get('body', ''),
+                        author_name=a.get('author_name', 'Usuário'),
+                        author_avatar=a.get('author_avatar', 'user'),
+                        upvotes=min(int(a.get('upvotes', 0)), 999),
+                        is_accepted=bool(a.get('is_accepted', False)) if i == 0 else False,
+                        order=i,
+                    ))
+                CommunityAnswer.objects.bulk_create(answer_objs)
+                question.answer_count = len(answer_objs)
+                question.save(update_fields=['answer_count'])
+
+                generated += 1
+                questions_data.append({'title': question.title, 'answers': answers_data})
+
+            except Exception as e:
+                errors += 1
+                print(f'[community] Erro ao gerar pergunta: {e}')
+
+    config.last_generated_at = timezone.now()
+    config.save(update_fields=['last_generated_at'])
+
+    return {'generated': generated, 'errors': errors, 'questions': questions_data}
+```
+
+---
+
+## 3. Views (`apps/community/views.py`)
+
+```python
+from django.shortcuts import render, get_object_or_404
+from django.db.models import F, Count, Q
+
+from .models import CommunityCategory, CommunityQuestion, CommunityAnswer
+
+
+def community_home(request):
+    categories = (
+        CommunityCategory.objects
+        .filter(is_active=True)
+        # IMPORTANTE: usar nome diferente de qualquer @property do model
+        .annotate(num_questions=Count('questions', filter=Q(questions__is_published=True)))
+        .order_by('order')
+    )
+    recent_questions = (
+        CommunityQuestion.objects.filter(is_published=True)
+        .select_related('category')
+        .order_by('-created_at')[:20]
+    )
+    return render(request, 'community/home.html', {
+        'categories': categories,
+        'recent_questions': recent_questions,
+        'total_questions': CommunityQuestion.objects.filter(is_published=True).count(),
+        'total_answers': CommunityAnswer.objects.count(),
+    })
+
+
+def community_category(request, cat_slug):
+    category = get_object_or_404(CommunityCategory, slug=cat_slug, is_active=True)
+    all_qs = CommunityQuestion.objects.filter(category=category, is_published=True).order_by('-created_at')
+
+    per_page = 20
+    page = max(1, int(request.GET.get('page', 1)))
+    total = all_qs.count()
+    total_pages = max(1, (total + per_page - 1) // per_page)
+    page = min(page, total_pages)
+    questions = all_qs[(page-1)*per_page : page*per_page]
+
+    return render(request, 'community/category.html', {
+        'category': category,
+        'questions': questions,
+        'total': total,
+        'page': page,
+        'total_pages': total_pages,
+        'has_prev': page > 1,
+        'has_next': page < total_pages,
+        'prev_page': page - 1,
+        'next_page': page + 1,
+        'other_categories': CommunityCategory.objects.filter(is_active=True).exclude(pk=category.pk).order_by('order'),
+    })
+
+
+def community_question(request, cat_slug, q_slug):
+    category = get_object_or_404(CommunityCategory, slug=cat_slug, is_active=True)
+    question = get_object_or_404(CommunityQuestion, slug=q_slug, category=category, is_published=True)
+
+    CommunityQuestion.objects.filter(pk=question.pk).update(views=F('views') + 1)
+    question.views += 1
+
+    answers = list(question.answers.all().order_by('-is_accepted', 'order', '-upvotes'))
+    accepted_answer = next((a for a in answers if a.is_accepted), None)
+    other_answers   = [a for a in answers if not a.is_accepted]
+
+    return render(request, 'community/question.html', {
+        'category': category,
+        'question': question,
+        'answers': answers,
+        'accepted_answer': accepted_answer,
+        'other_answers': other_answers,
+        'related_questions': (
+            CommunityQuestion.objects.filter(category=category, is_published=True)
+            .exclude(pk=question.pk).order_by('-created_at')[:5]
+        ),
+        'all_categories': CommunityCategory.objects.filter(is_active=True).order_by('order'),
+    })
+```
+
+---
+
+## 4. Sitemap (`apps/community/sitemaps.py`)
+
+```python
+from django.contrib.sitemaps import Sitemap
+from .models import CommunityCategory, CommunityQuestion
+
+
+class CommunityCategorySitemap(Sitemap):
+    changefreq = 'daily'
+    priority = 0.7
+
+    def items(self):
+        return CommunityCategory.objects.filter(is_active=True).order_by('order')
+
+    def location(self, obj):
+        return f'/comunidade/{obj.slug}/'
+
+    def lastmod(self, obj):
+        latest = (
+            CommunityQuestion.objects.filter(category=obj, is_published=True)
+            .order_by('-created_at').values_list('created_at', flat=True).first()
+        )
+        return latest or obj.created_at
+
+
+class CommunityQuestionSitemap(Sitemap):
+    changefreq = 'weekly'
+    priority = 0.8
+
+    def items(self):
+        return CommunityQuestion.objects.filter(is_published=True).select_related('category').order_by('-created_at')
+
+    def location(self, obj):
+        return f'/comunidade/{obj.category.slug}/{obj.slug}/'
+
+    def lastmod(self, obj):
+        return obj.updated_at
+```
+
+### Registrar no `config/urls.py`:
+
+```python
+from django.contrib.sitemaps.views import sitemap
+from apps.community.sitemaps import CommunityCategorySitemap, CommunityQuestionSitemap
+
+sitemaps = {
+    'community_categories': CommunityCategorySitemap,
+    'community_questions': CommunityQuestionSitemap,
+}
+
+urlpatterns += [
+    path('sitemap.xml', sitemap, {'sitemaps': sitemaps}, name='django.contrib.sitemaps.views.sitemap'),
+    path('comunidade/', include('apps.community.urls', namespace='community')),
+    path('dashboard/comunidade/', include('apps.community.admin_urls', namespace='community_admin')),
+]
+```
+
+---
+
+## 5. URLs (`apps/community/urls.py`)
+
+```python
+from django.urls import path
+from . import views
+
+app_name = 'community'
+
+urlpatterns = [
+    path('', views.community_home, name='home'),
+    path('<slug:cat_slug>/', views.community_category, name='category'),
+    path('<slug:cat_slug>/<slug:q_slug>/', views.community_question, name='question'),
+]
+```
+
+---
+
+## 6. Tasks Celery (`apps/community/tasks.py`)
+
+```python
+from celery import shared_task
+
+
+@shared_task(name='community.generate_daily')
+def generate_daily_community_content():
+    from apps.community.services.generator import generate_daily_content
+    result = generate_daily_content()
+    return result
+```
+
+### Adicionar em `config/celery.py` (no `app.conf.beat_schedule`):
+
+```python
+'generate-community-daily': {
+    'task': 'community.generate_daily',
+    'schedule': crontab(hour=8, minute=0),   # 8h UTC = 5h BRT
+},
+```
+
+---
+
+## 7. Template: Avatar DiceBear
+
+O DiceBear estilo `thumbs` gera avatares coloridos e únicos a partir de um seed (string qualquer).
+A IA gera o campo `author_avatar` com o primeiro nome em minúsculas sem acento (ex: `"maria"`, `"carlos"`),
+garantindo um avatar consistente e diferente para cada persona.
+
+**URL do avatar:**
+```
+https://api.dicebear.com/7.x/thumbs/svg?seed=maria&backgroundColor=b6e3f4,c0aede,d1d4f9,ffd5dc,ffdfbf
+```
+
+**Uso nos templates:**
+```html
+<!-- Avatar DiceBear gerado pelo seed da IA -->
+<img src="https://api.dicebear.com/7.x/thumbs/svg?seed={{ q.author_avatar }}&backgroundColor=b6e3f4,c0aede,d1d4f9,ffd5dc,ffdfbf"
+     alt="{{ q.author_name }}"
+     class="w-10 h-10 rounded-full bg-muted flex-shrink-0">
+```
+
+**Outros estilos disponíveis no DiceBear** (trocar `thumbs` por qualquer um):
+| Estilo | Visual |
+|--------|--------|
+| `thumbs` | Personagens fofos (padrão desta skill) |
+| `avataaars` | Estilo cartoon humano |
+| `micah` | Minimalista moderno |
+| `personas` | Rostos realistas ilustrados |
+| `lorelei` | Feminino elegante |
+| `fun-emoji` | Emojis expressivos |
+
+> O seed `author_avatar` é definido pela IA no momento da geração como o primeiro nome em minúsculas.
+> Mesmo seed sempre gera o mesmo avatar — consistência garantida.
+
+---
+
+## 8. Template: Home (`templates/community/home.html`)
+
+```html
+{% extends 'base.html' %}
+{% load static %}
+
+{% block title %}Comunidade — {{ site_name }}{% endblock %}
+{% block meta_description %}Fórum de perguntas e respostas sobre [NICHO]. Dicas, estratégias e experiências da comunidade.{% endblock %}
+
+{% block extra_head %}
+<link rel="canonical" href="https://SEUDOMINIO.com.br/comunidade/">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  "itemListElement": [
+    {"@type": "ListItem", "position": 1, "name": "{{ site_name }}", "item": "https://SEUDOMINIO.com.br/"},
+    {"@type": "ListItem", "position": 2, "name": "Comunidade", "item": "https://SEUDOMINIO.com.br/comunidade/"}
+  ]
+}
+</script>
+{% endblock %}
+
+{% block body %}
+<!-- Stats: total_questions, total_answers, categories|length -->
+<!-- Categorias: {% for cat in categories %} cat.slug, cat.name, cat.icon, cat.color, cat.num_questions -->
+<!-- Perguntas recentes: {% for q in recent_questions %} q.category.slug, q.slug, q.title, q.author_name, q.answer_count, q.views, q.created_at -->
+{% endblock %}
+```
+
+---
+
+## 9. Template: Pergunta — SEO Estruturado (`templates/community/question.html`)
+
+### Schema.org QAPage (máximo SEO para perguntas):
+
+```html
+{% block extra_head %}
+<link rel="canonical" href="https://SEUDOMINIO.com.br/comunidade/{{ question.category.slug }}/{{ question.slug }}/">
+
+<!-- Schema.org QAPage -->
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "QAPage",
+  "mainEntity": {
+    "@type": "Question",
+    "name": "{{ question.title|escapejs }}",
+    "text": "{{ question.body|escapejs }}",
+    "dateCreated": "{{ question.created_at|date:'Y-m-d' }}",
+    "author": {"@type": "Person", "name": "{{ question.author_name|escapejs }}"},
+    "answerCount": {{ question.answer_count }},
+    {% if accepted_answer %}
+    "acceptedAnswer": {
+      "@type": "Answer",
+      "text": "{{ accepted_answer.body|escapejs }}",
+      "dateCreated": "{{ accepted_answer.created_at|date:'Y-m-d' }}",
+      "upvoteCount": {{ accepted_answer.upvotes }},
+      "author": {"@type": "Person", "name": "{{ accepted_answer.author_name|escapejs }}"}
+    },
+    {% endif %}
+    "suggestedAnswer": [
+      {% for ans in other_answers %}
+      {
+        "@type": "Answer",
+        "text": "{{ ans.body|escapejs }}",
+        "dateCreated": "{{ ans.created_at|date:'Y-m-d' }}",
+        "upvoteCount": {{ ans.upvotes }},
+        "author": {"@type": "Person", "name": "{{ ans.author_name|escapejs }}"}
+      }{% if not forloop.last %},{% endif %}
+      {% endfor %}
+    ]
+  }
+}
+</script>
+
+<!-- BreadcrumbList -->
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  "itemListElement": [
+    {"@type": "ListItem", "position": 1, "name": "Home", "item": "https://SEUDOMINIO.com.br/"},
+    {"@type": "ListItem", "position": 2, "name": "Comunidade", "item": "https://SEUDOMINIO.com.br/comunidade/"},
+    {"@type": "ListItem", "position": 3, "name": "{{ question.category.name }}", "item": "https://SEUDOMINIO.com.br/comunidade/{{ question.category.slug }}/"},
+    {"@type": "ListItem", "position": 4, "name": "{{ question.title|escapejs }}", "item": "https://SEUDOMINIO.com.br/comunidade/{{ question.category.slug }}/{{ question.slug }}/"}
+  ]
+}
+</script>
+
+<!-- DiscussionForumPosting — schema correto para tópicos de fórum -->
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "DiscussionForumPosting",
+  "headline": "{{ question.title|escapejs }}",
+  "text": "{{ question.body|escapejs }}",
+  "url": "https://SEUDOMINIO.com.br/comunidade/{{ question.category.slug }}/{{ question.slug }}/",
+  "datePublished": "{{ question.created_at|date:'Y-m-d' }}",
+  "dateModified": "{{ question.updated_at|date:'Y-m-d' }}",
+  "author": {
+    "@type": "Person",
+    "name": "{{ question.author_name|escapejs }}"
+  },
+  "interactionStatistic": {
+    "@type": "InteractionCounter",
+    "interactionType": "https://schema.org/ReplyAction",
+    "userInteractionCount": {{ question.answer_count }}
+  }
+}
+</script>
+{% endblock %}
+```
+
+### Variáveis disponíveis no template `question.html`:
+| Variável | Descrição |
+|----------|-----------|
+| `question` | objeto CommunityQuestion |
+| `category` | objeto CommunityCategory |
+| `answers` | lista completa de respostas |
+| `accepted_answer` | primeira resposta com `is_accepted=True` (ou None) |
+| `other_answers` | respostas sem `is_accepted` |
+| `related_questions` | últimas 5 perguntas da mesma categoria |
+| `all_categories` | todas as categorias ativas (para sidebar) |
+
+---
+
+## 10. Seed de Categorias (`management/commands/seed_community_categories.py`)
+
+```python
+from django.core.management.base import BaseCommand
+from apps.community.models import CommunityCategory
+
+CATEGORIES = [
+    # (slug, nome, descrição, ícone lucide, cor hex)
+    ('fornecedores', 'Fornecedores', 'Onde comprar, avaliar e negociar com fornecedores', 'shopping-bag', '#f59e0b'),
+    ('galvanica', 'Galvânica e Banhamento', 'Processos, equipamentos e produtos para galvânica', 'zap', '#8b5cf6'),
+    ('vendas', 'Vendas e Precificação', 'Como precificar, vender mais e fidelizar clientes', 'trending-up', '#10b981'),
+    ('marketing', 'Marketing Digital', 'Instagram, WhatsApp, anúncios e presença online', 'smartphone', '#3b82f6'),
+    ('gestao', 'Gestão e CRM', 'Organização, processos, clientes e financeiro', 'layout-dashboard', '#6366f1'),
+    ('eventos', 'Eventos e Feiras', 'Feiras, exposições e eventos do setor', 'calendar', '#ec4899'),
+    ('empreendedorismo', 'Empreendedorismo', 'Como montar, crescer e profissionalizar o negócio', 'rocket', '#f97316'),
+    ('tendencias', 'Tendências de Moda', 'O que está em alta nas joias e semi-joias', 'sparkles', '#14b8a6'),
+    ('qualidade', 'Qualidade e Cuidados', 'Garantia, conservação e dúvidas técnicas sobre peças', 'shield', '#ef4444'),
+    ('estoque', 'Estoque e Logística', 'Gestão de estoque, envios e controle de peças', 'package', '#64748b'),
+]
+
+class Command(BaseCommand):
+    help = 'Cria as categorias iniciais da comunidade'
+
+    def handle(self, *args, **kwargs):
+        for i, (slug, name, desc, icon, color) in enumerate(CATEGORIES):
+            obj, created = CommunityCategory.objects.get_or_create(slug=slug, defaults={
+                'name': name, 'description': desc, 'icon': icon,
+                'color': color, 'order': i,
+            })
+            status = 'criada' if created else 'já existe'
+            self.stdout.write(f'  {status}: {name}')
+        self.stdout.write(self.style.SUCCESS('Categorias criadas com sucesso!'))
+```
+
+---
+
+## 11. Management Command de Geração (`management/commands/generate_community.py`)
+
+```python
+from django.core.management.base import BaseCommand
+from apps.community.services.generator import generate_daily_content
+
+class Command(BaseCommand):
+    help = 'Gera perguntas e respostas da comunidade usando IA'
+
+    def add_arguments(self, parser):
+        parser.add_argument('--count', type=int, default=None)
+
+    def handle(self, *args, **options):
+        count = options.get('count')
+        self.stdout.write(f'Gerando conteúdo... ({count or "padrão do config"} perguntas)')
+        result = generate_daily_content(count=count)
+        if result.get('error'):
+            self.stdout.write(self.style.ERROR(f'Erro: {result["error"]}'))
+            return
+        n_q = result.get('generated', 0)
+        n_e = result.get('errors', 0)
+        self.stdout.write(self.style.SUCCESS(f'✓ {n_q} perguntas geradas, {n_e} erros.'))
+```
+
+---
+
+## 12. Checklist de Deploy Completo
+
+### Passo 1 — Migrations e categorias
+```bash
+PYTHON=/home/USUARIO/htdocs/DOMINIO/backend/venv/bin/python
+BACKEND=/home/USUARIO/htdocs/DOMINIO/backend
+
+cd $BACKEND
+$PYTHON manage.py makemigrations community
+$PYTHON manage.py migrate
+$PYTHON manage.py seed_community_categories
+```
+
+### Passo 2 — Gerar 500 perguntas iniciais (conteúdo de lançamento)
+```bash
+# Roda em background para não travar o terminal (~20-40 min dependendo do modelo)
+nohup $PYTHON manage.py generate_community --count=500 > /tmp/community_gen.log 2>&1 &
+
+# Acompanhar progresso
+tail -f /tmp/community_gen.log
+```
+
+> **Custo estimado:** `gpt-4o-mini` custa ~16x menos que `gpt-4o`.
+> Para 500 perguntas com ~9 respostas cada, o custo fica em torno de **$1–3 USD** com o mini.
+> Use `gpt-4o` apenas se precisar de qualidade premium — o mini já gera conteúdo excelente para SEO.
+
+### Passo 3 — Configurar Celery Beat no Supervisor
+
+Adicionar ao arquivo de configuração do supervisor (ex: `/etc/supervisor/conf.d/SEUAPP.conf`):
+
+```ini
+[program:SEUAPP-beat]
+command=/home/USUARIO/htdocs/DOMINIO/backend/venv/bin/celery -A config beat -l INFO
+directory=/home/USUARIO/htdocs/DOMINIO/backend
+user=USUARIO
+autostart=true
+autorestart=true
+redirect_stderr=true
+stdout_logfile=/home/USUARIO/htdocs/DOMINIO/logs/celery-beat.log
+environment=DJANGO_SETTINGS_MODULE="config.settings"
+```
+
+```bash
+# Aplicar configuração
+sudo supervisorctl reread
+sudo supervisorctl update
+sudo supervisorctl start SEUAPP-beat
+
+# Verificar status
+sudo supervisorctl status
+```
+
+> **Importante:** Use o scheduler padrão do Celery (`celery beat` sem `--scheduler`).
+> O `DatabaseScheduler` do `django-celery-beat` requer que o app esteja em `INSTALLED_APPS` e com migrations rodadas.
+
+### Passo 4 — Verificar sitemap e reiniciar
+```bash
+sudo supervisorctl restart SEUAPP:*
+
+# Testar sitemap (deve retornar 200)
+curl -s -o /dev/null -w "%{http_code}" https://SEUDOMINIO.com.br/sitemap.xml
+
+# Testar home da comunidade
+curl -s -o /dev/null -w "%{http_code}" https://SEUDOMINIO.com.br/comunidade/
+```
+
+### Passo 5 — Submeter sitemap no Google Search Console
+```
+https://SEUDOMINIO.com.br/sitemap.xml
+```
+Adicionar no painel: Search Console → Sitemaps → Adicionar novo sitemap.
+
+---
+
+## 13. Notas Críticas de Implementação
+
+### ⚠️ Conflito model property vs ORM annotation
+Se o model `CommunityCategory` tiver um `@property question_count`, o Django lança `AttributeError: property has no setter` ao tentar fazer `annotate(question_count=...)`. **Solução:** use outro nome na annotation, ex: `annotate(num_questions=...)`.
+
+### ⚠️ Celery Beat — scheduler
+Prefira definir o `beat_schedule` diretamente em `config/celery.py` (`app.conf.beat_schedule`) em vez de `CELERY_BEAT_SCHEDULE` no `settings.py`. O settings pode ser sobrescrito pelo celery.py.
+
+### ⚠️ OpenAI `response_format={'type': 'json_object'}`
+Só funciona com `gpt-4o`, `gpt-4o-mini` e `gpt-4-turbo`. Para o endpoint de respostas (array JSON), use regex para extrair `[...]` do retorno pois o formato json_object retorna objeto, não array.
+
+### ⚠️ Bulk create de respostas
+Use `CommunityAnswer.objects.bulk_create(lista)` para performance. Atualize `question.answer_count` com `save(update_fields=['answer_count'])` após o bulk_create.
+
+### ✅ Schema.org correto para fórum
+Não existe `Community` no Schema.org. Use o trio:
+- `QAPage` → ativa featured snippet (mais importante)
+- `BreadcrumbList` → navegação no resultado Google
+- `DiscussionForumPosting` → tipo semântico correto para tópico de fórum
+
+### ✅ DiceBear thumbs — URL correta
+```
+https://api.dicebear.com/7.x/thumbs/svg?seed=SEED&backgroundColor=b6e3f4,c0aede,d1d4f9,ffd5dc,ffdfbf
+```
+O `SEED` é o campo `author_avatar` gerado pela IA (primeiro nome em minúsculas, sem acento).
+Mesmo seed → mesmo avatar sempre. Para trocar o estilo visual basta substituir `thumbs` por outro nome.
+
+---
+
+## 14. SEO — Resumo de todas as tags implementadas
+
+| Tag / Schema | Página | Descrição |
+|-------------|--------|-----------|
+| `<title>` | todas | `seo_title` da pergunta/categoria |
+| `<meta description>` | todas | `seo_description` da pergunta/categoria |
+| `<link rel="canonical">` | todas | URL canônica completa |
+| `Schema.org QAPage` | question | Principal — ativa featured snippet no Google |
+| `Schema.org BreadcrumbList` | todas | Breadcrumb navegável no resultado Google |
+| `Schema.org DiscussionForumPosting` | question | Tipo correto para tópicos de fórum |
+| `sitemap.xml` | — | Todas as categorias e perguntas indexadas |
+
+> **Não existe** o tipo `Community` no Schema.org.
+> O trio correto para fórum Q&A é: **QAPage + BreadcrumbList + DiscussionForumPosting**.
+
+---
+
+*Skill gerada a partir da implementação em produção do VitoriaCRM — fevereiro/2026.*
