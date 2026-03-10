@@ -1,0 +1,2212 @@
+# Skill: Central de Atendimento WhatsApp Multi-Instância
+
+> **Copie este arquivo para qualquer projeto Django e siga o passo a passo.**
+> Implementa do zero uma central de atendimento WhatsApp completa com:
+> QR Code, multi-instâncias, multi-tenant, IA, sentimento, mídia, CRM, templates, departamentos.
+
+---
+
+## Stack & Dependências
+
+```txt
+# requirements.txt
+django>=4.2
+neonize>=0.9.0          # WhatsApp Web via Go (QR code)
+requests>=2.28
+celery>=5.3             # Tarefas assíncronas (opcional)
+redis>=4.0              # Broker Celery + cache
+Pillow>=10.0            # Processamento de imagem
+pydub>=0.25             # Processamento de áudio
+google-generativeai     # Gemini AI (sentimento)
+openai                  # GPT (IA conversacional)
+python-dateutil
+```
+
+### Neonize — instalação especial
+
+```bash
+pip install neonize
+
+# Neonize usa uma lib Go compilada internamente.
+# Funciona em Linux/macOS. No Windows use WSL2.
+# Sessão fica em arquivo .db (SQLite) por instância.
+```
+
+### Alternativas à Neonize (mesmo contrato)
+
+| Lib | Tipo | QR | Oficial |
+|-----|------|-----|---------|
+| **neonize** | WhatsApp Web | ✅ | ❌ |
+| **whatsmeow** | WhatsApp Web (Go) | ✅ | ❌ |
+| **WPPConnect** | WhatsApp Web (Node) | ✅ | ❌ |
+| **Evolution API** | Self-hosted REST | ✅ | ❌ |
+| **ChatPRO** | SaaS REST webhook | N/A | ❌ |
+| **Meta Cloud API** | Oficial REST | N/A | ✅ |
+
+---
+
+## Estrutura de Arquivos
+
+```
+apps/
+└── whatsapp/
+    ├── __init__.py
+    ├── admin.py
+    ├── apps.py
+    ├── forms.py
+    ├── models.py                    # Todos os models
+    ├── signals.py                   # Auto-criar departamento no tenant
+    ├── tasks.py                     # Celery tasks
+    ├── urls.py                      # URL patterns
+    ├── views.py                     # Views e API endpoints
+    ├── whatsapp_manager.py          # Singleton de instâncias ativas
+    ├── chatpro_webhook.py           # Webhook ChatPRO → CRM
+    ├── migrations/
+    └── services/
+        ├── __init__.py
+        ├── neonize_client.py        # Wrapper Neonize
+        ├── message_handler.py       # Lógica de mensagens
+        └── sentiment.py             # Análise de sentimento
+
+templates/
+└── whatsapp/
+    ├── inbox.html                   # Central moderna (Alpine.js)
+    ├── conversation_detail.html     # Conversa individual (estilo WhatsApp)
+    ├── instance_list.html           # Gerenciar instâncias + QR code
+    ├── connection.html              # Conexão legada single-session
+    ├── template_list.html           # Templates de mensagem
+    ├── contact_list.html            # Contatos
+    ├── department_list.html         # Departamentos
+    └── tag_list.html                # Tags
+```
+
+---
+
+## 1. Models (models.py)
+
+```python
+import uuid, secrets
+from django.db import models
+from django.utils import timezone
+from apps.tenants.models import Tenant
+from apps.core.models import User
+
+
+# ─── WhatsAppInstance ────────────────────────────────────────────────────────
+
+class WhatsAppInstance(models.Model):
+    """Uma linha WhatsApp (número) por instância. Tenant pode ter várias."""
+
+    API_TYPE_CHOICES = [
+        ('internal', 'API Vitória CRM (QR Code)'),
+        ('official', 'WhatsApp Business API (Meta)'),
+        ('chatpro',  'ChatPRO'),
+    ]
+    STATUS_CHOICES = [
+        ('disconnected', 'Desconectado'),
+        ('connecting',   'Conectando'),
+        ('qr_code',      'Aguardando QR'),
+        ('connected',    'Conectado'),
+        ('error',        'Erro'),
+    ]
+
+    id             = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    tenant         = models.ForeignKey(Tenant, on_delete=models.CASCADE, related_name='whatsapp_instances')
+    api_type       = models.CharField(max_length=20, choices=API_TYPE_CHOICES, default='internal')
+    name           = models.CharField('Nome', max_length=100)
+
+    # Autenticação
+    api_key        = models.CharField(max_length=64, blank=True, unique=True)
+    webhook_url    = models.URLField(blank=True)
+    chatpro_webhook_token = models.CharField(max_length=64, blank=True, null=True, unique=True)
+
+    # Status
+    status         = models.CharField(max_length=20, choices=STATUS_CHOICES, default='disconnected')
+    status_message = models.TextField(blank=True)
+
+    # Sessão
+    phone_number   = models.CharField(max_length=20, blank=True)
+    device_name    = models.CharField(max_length=100, blank=True)
+    session_path   = models.CharField(max_length=500, blank=True)
+
+    # QR Code
+    qr_code             = models.TextField(blank=True)   # base64 PNG
+    qr_code_updated_at  = models.DateTimeField(null=True, blank=True)
+
+    # Estatísticas
+    messages_sent     = models.PositiveIntegerField(default=0)
+    messages_received = models.PositiveIntegerField(default=0)
+    last_activity     = models.DateTimeField(null=True, blank=True)
+
+    # Configurações
+    auto_reply_enabled   = models.BooleanField(default=True)
+    ai_enabled           = models.BooleanField(default=True)
+    business_hours_only  = models.BooleanField(default=False)
+    sentiment_enabled    = models.BooleanField(default=True)
+    gemini_api_key       = models.CharField(max_length=200, blank=True)
+
+    connected_at    = models.DateTimeField(null=True, blank=True)
+    disconnected_at = models.DateTimeField(null=True, blank=True)
+    created_at      = models.DateTimeField(auto_now_add=True)
+    updated_at      = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = 'Instância WhatsApp'
+
+    def __str__(self):
+        return f'{self.tenant} – {self.name}'
+
+    def save(self, *args, **kwargs):
+        if not self.api_key:
+            self.api_key = 'wapi_' + secrets.token_hex(28)
+        super().save(*args, **kwargs)
+
+    def get_session_path(self):
+        from django.conf import settings
+        import os
+        base = getattr(settings, 'WHATSAPP_SESSION_PATH',
+                       os.path.join(settings.BASE_DIR, 'whatsapp_sessions'))
+        os.makedirs(base, exist_ok=True)
+        return os.path.join(base, f'instance_{self.id}.db')
+
+    def get_or_create_chatpro_token(self):
+        if not self.chatpro_webhook_token:
+            self.chatpro_webhook_token = secrets.token_hex(32)
+            self.save(update_fields=['chatpro_webhook_token'])
+        return self.chatpro_webhook_token
+
+    def update_status(self, status, message=''):
+        self.status = status
+        self.status_message = message
+        if status == 'connected':
+            self.connected_at = timezone.now()
+        elif status == 'disconnected':
+            self.disconnected_at = timezone.now()
+            self.qr_code = ''
+        self.save(update_fields=['status', 'status_message',
+                                  'connected_at', 'disconnected_at', 'qr_code'])
+
+    def set_qr_code(self, qr_base64):
+        self.qr_code = qr_base64
+        self.qr_code_updated_at = timezone.now()
+        self.status = 'qr_code'
+        self.save(update_fields=['qr_code', 'qr_code_updated_at', 'status'])
+
+    def increment_messages(self, sent=0, received=0):
+        WhatsAppInstance.objects.filter(pk=self.pk).update(
+            messages_sent=models.F('messages_sent') + sent,
+            messages_received=models.F('messages_received') + received,
+            last_activity=timezone.now(),
+        )
+
+    @property
+    def is_connected(self):
+        return self.status == 'connected'
+
+
+# ─── WhatsAppContact ─────────────────────────────────────────────────────────
+
+class WhatsAppContact(models.Model):
+    tenant            = models.ForeignKey(Tenant, on_delete=models.CASCADE)
+    jid               = models.CharField(max_length=50)  # "5511...@s.whatsapp.net"
+    phone             = models.CharField(max_length=30)
+    phone_normalized  = models.CharField(max_length=30, db_index=True)
+    name              = models.CharField(max_length=255, blank=True)
+    push_name         = models.CharField(max_length=255, blank=True)
+    profile_picture_url = models.URLField(blank=True)
+    is_business       = models.BooleanField(default=False)
+    is_blocked        = models.BooleanField(default=False)
+    lead              = models.ForeignKey('crm.Lead', null=True, blank=True, on_delete=models.SET_NULL)
+    last_seen         = models.DateTimeField(null=True, blank=True)
+    created_at        = models.DateTimeField(auto_now_add=True)
+    updated_at        = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        unique_together = ('tenant', 'jid')
+
+    @property
+    def display_name(self):
+        return self.push_name or self.name or self.phone
+
+
+# ─── Department ──────────────────────────────────────────────────────────────
+
+class Department(models.Model):
+    tenant      = models.ForeignKey(Tenant, on_delete=models.CASCADE)
+    name        = models.CharField(max_length=100)
+    color       = models.CharField(max_length=7, default='#6366f1')
+    is_default  = models.BooleanField(default=False)
+    is_active   = models.BooleanField(default=True)
+    created_at  = models.DateTimeField(auto_now_add=True)
+
+
+class UserDepartment(models.Model):
+    user          = models.ForeignKey(User, on_delete=models.CASCADE)
+    department    = models.ForeignKey(Department, on_delete=models.CASCADE)
+    is_supervisor = models.BooleanField(default=False)
+    joined_at     = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = ('user', 'department')
+
+
+# ─── ConversationTag ─────────────────────────────────────────────────────────
+
+class ConversationTag(models.Model):
+    tenant = models.ForeignKey(Tenant, on_delete=models.CASCADE)
+    name   = models.CharField(max_length=50)
+    slug   = models.SlugField()
+    color  = models.CharField(max_length=7, default='#6366f1')
+
+    class Meta:
+        unique_together = ('tenant', 'slug')
+
+
+# ─── Conversation ─────────────────────────────────────────────────────────────
+
+class Conversation(models.Model):
+    STATUS_CHOICES = [
+        ('open',        'Aberta'),
+        ('pending',     'Pendente'),
+        ('in_progress', 'Em Atendimento'),
+        ('resolved',    'Resolvida'),
+        ('closed',      'Fechada'),
+    ]
+    CHANNEL_CHOICES = [
+        ('whatsapp',  'WhatsApp'),
+        ('telegram',  'Telegram'),
+        ('instagram', 'Instagram'),
+        ('webchat',   'Chat do Site'),
+    ]
+    SENTIMENT_CHOICES = [
+        ('positive', 'Positivo'),
+        ('negative', 'Negativo'),
+        ('neutral',  'Neutro'),
+    ]
+
+    tenant      = models.ForeignKey(Tenant, on_delete=models.CASCADE)
+    instance    = models.ForeignKey(WhatsAppInstance, null=True, blank=True, on_delete=models.SET_NULL)
+    contact     = models.ForeignKey(WhatsAppContact, on_delete=models.CASCADE)
+    lead        = models.ForeignKey('crm.Lead', null=True, blank=True, on_delete=models.SET_NULL)
+    channel     = models.CharField(max_length=20, choices=CHANNEL_CHOICES, default='whatsapp')
+    department  = models.ForeignKey(Department, null=True, blank=True, on_delete=models.SET_NULL)
+    assigned_to = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL)
+
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='open')
+
+    # Cache da última mensagem
+    last_message_text           = models.TextField(blank=True)
+    last_message_at             = models.DateTimeField(null=True, blank=True)
+    last_message_from_contact   = models.BooleanField(default=True)
+    last_message_sentiment      = models.CharField(max_length=10, choices=SENTIMENT_CHOICES, blank=True)
+    last_message_sentiment_reason = models.CharField(max_length=200, blank=True)
+
+    unread_count  = models.PositiveIntegerField(default=0)
+    message_count = models.PositiveIntegerField(default=0)
+
+    ai_enabled    = models.BooleanField(default=True)
+    ai_paused_until = models.DateTimeField(null=True, blank=True)
+
+    is_group    = models.BooleanField(default=False)
+    is_archived = models.BooleanField(default=False)
+
+    tags = models.JSONField(default=list)
+    conversation_tags = models.ManyToManyField(ConversationTag, blank=True)
+    metadata = models.JSONField(default=dict)
+
+    started_at         = models.DateTimeField(auto_now_add=True)
+    first_response_at  = models.DateTimeField(null=True, blank=True)
+    resolved_at        = models.DateTimeField(null=True, blank=True)
+    closed_at          = models.DateTimeField(null=True, blank=True)
+    updated_at         = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-last_message_at']
+        indexes  = [
+            models.Index(fields=['tenant', 'status']),
+            models.Index(fields=['tenant', 'last_message_at']),
+        ]
+
+    @property
+    def is_waiting_first_response(self):
+        return self.first_response_at is None
+
+    @property
+    def is_waiting_interaction(self):
+        return (
+            self.first_response_at is not None
+            and self.last_message_from_contact
+            and self.status not in ('resolved', 'closed')
+        )
+
+    @property
+    def effective_status(self):
+        if self.status in ('resolved', 'closed'):
+            return self.status
+        if self.is_waiting_first_response:
+            return 'waiting_service'
+        if self.is_waiting_interaction:
+            return 'waiting_response'
+        return self.status
+
+    def mark_as_read(self):
+        self.unread_count = 0
+        self.save(update_fields=['unread_count'])
+
+    def pause_ai(self, hours=24):
+        self.ai_paused_until = timezone.now() + timezone.timedelta(hours=hours)
+        self.save(update_fields=['ai_paused_until'])
+
+    def resume_ai(self):
+        self.ai_paused_until = None
+        self.save(update_fields=['ai_paused_until'])
+
+    def close(self):
+        self.status = 'closed'
+        self.closed_at = timezone.now()
+        self.save(update_fields=['status', 'closed_at'])
+
+
+# ─── Message ──────────────────────────────────────────────────────────────────
+
+class Message(models.Model):
+    TYPE_CHOICES = [
+        ('text',     'Texto'),
+        ('image',    'Imagem'),
+        ('video',    'Vídeo'),
+        ('audio',    'Áudio'),
+        ('document', 'Documento'),
+        ('sticker',  'Sticker'),
+        ('location', 'Localização'),
+        ('contact',  'Contato'),
+        ('reaction', 'Reação'),
+        ('system',   'Sistema'),
+    ]
+    STATUS_CHOICES = [
+        ('pending',   'Pendente'),
+        ('sent',      'Enviado'),
+        ('delivered', 'Entregue'),
+        ('read',      'Lido'),
+        ('failed',    'Falhou'),
+    ]
+    SENDER_CHOICES = [
+        ('contact', 'Contato'),
+        ('user',    'Usuário'),
+        ('ai',      'IA'),
+        ('system',  'Sistema'),
+    ]
+
+    conversation    = models.ForeignKey(Conversation, on_delete=models.CASCADE, related_name='messages')
+    message_id      = models.CharField(max_length=255, blank=True)  # WhatsApp ID
+    message_type    = models.CharField(max_length=20, choices=TYPE_CHOICES, default='text')
+    content         = models.TextField(blank=True)
+
+    # Mídia
+    media_url       = models.URLField(blank=True)
+    media_mime_type = models.CharField(max_length=100, blank=True)
+    media_filename  = models.CharField(max_length=255, blank=True)
+    media_size      = models.PositiveIntegerField(default=0)
+    media_duration  = models.PositiveIntegerField(default=0)  # segundos
+    media_caption   = models.TextField(blank=True)
+
+    # Localização
+    latitude      = models.FloatField(null=True, blank=True)
+    longitude     = models.FloatField(null=True, blank=True)
+    location_name = models.CharField(max_length=255, blank=True)
+
+    sender_type = models.CharField(max_length=10, choices=SENDER_CHOICES, default='contact')
+    sender_user = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL)
+    status      = models.CharField(max_length=10, choices=STATUS_CHOICES, default='delivered')
+
+    delivered_at = models.DateTimeField(null=True, blank=True)
+    read_at      = models.DateTimeField(null=True, blank=True)
+
+    quoted_message = models.ForeignKey('self', null=True, blank=True, on_delete=models.SET_NULL)
+
+    ai_generated    = models.BooleanField(default=False)
+    ai_model        = models.CharField(max_length=50, blank=True)
+    ai_tokens_used  = models.PositiveIntegerField(default=0)
+
+    sentiment = models.CharField(max_length=10, blank=True,
+                                 choices=[('positive','Positivo'),('negative','Negativo'),('neutral','Neutro')])
+    metadata  = models.JSONField(default=dict)
+    timestamp = models.DateTimeField(default=timezone.now)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['timestamp']
+
+    @property
+    def is_from_contact(self):
+        return self.sender_type == 'contact'
+
+    def mark_delivered(self):
+        self.status = 'delivered'
+        self.delivered_at = timezone.now()
+        self.save(update_fields=['status', 'delivered_at'])
+
+    def mark_read(self):
+        self.status = 'read'
+        self.read_at = timezone.now()
+        self.save(update_fields=['status', 'read_at'])
+
+
+# ─── MessageTemplate ─────────────────────────────────────────────────────────
+
+class MessageTemplate(models.Model):
+    tenant     = models.ForeignKey(Tenant, on_delete=models.CASCADE)
+    name       = models.CharField(max_length=100)
+    slug       = models.SlugField()
+    category   = models.CharField(max_length=50, blank=True)
+    content    = models.TextField()
+    has_media  = models.BooleanField(default=False)
+    media_url  = models.URLField(blank=True)
+    variables  = models.JSONField(default=list)   # ['{{nome}}', '{{empresa}}']
+    usage_count = models.PositiveIntegerField(default=0)
+    is_active  = models.BooleanField(default=True)
+    created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = ('tenant', 'slug')
+
+    def render(self, context=None):
+        """Substitui {{variavel}} pelos valores do context dict."""
+        text = self.content
+        if context:
+            for key, value in context.items():
+                text = text.replace(f'{{{{{key}}}}}', str(value))
+        return text
+
+
+# ─── QuickReply ──────────────────────────────────────────────────────────────
+
+class QuickReply(models.Model):
+    tenant    = models.ForeignKey(Tenant, on_delete=models.CASCADE)
+    shortcut  = models.CharField(max_length=50)   # Ex: "/oi"
+    title     = models.CharField(max_length=100)
+    content   = models.TextField()
+    is_active = models.BooleanField(default=True)
+    usage_count = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        unique_together = ('tenant', 'shortcut')
+
+
+# ─── ConversationNote ────────────────────────────────────────────────────────
+
+class ConversationNote(models.Model):
+    """Nota interna — visível apenas para agentes."""
+    conversation = models.ForeignKey(Conversation, on_delete=models.CASCADE)
+    author       = models.ForeignKey(User, on_delete=models.SET_NULL, null=True)
+    content      = models.TextField()
+    created_at   = models.DateTimeField(auto_now_add=True)
+
+
+# ─── WebhookLog ──────────────────────────────────────────────────────────────
+
+class WebhookLog(models.Model):
+    tenant        = models.ForeignKey(Tenant, on_delete=models.CASCADE)
+    event_type    = models.CharField(max_length=100)
+    payload       = models.JSONField(default=dict)
+    processed     = models.BooleanField(default=False)
+    processed_at  = models.DateTimeField(null=True, blank=True)
+    error_message = models.TextField(blank=True)
+    created_at    = models.DateTimeField(auto_now_add=True)
+```
+
+---
+
+## 2. Neonize Client (services/neonize_client.py)
+
+```python
+import asyncio, logging
+from dataclasses import dataclass, field
+from typing import Optional, Callable
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class MessageData:
+    """Estrutura de mensagem recebida pelo Neonize."""
+    message_id:      str
+    jid:             str         # "5511...@s.whatsapp.net"
+    phone:           str
+    push_name:       str
+    message_type:    str         # "text", "image", "audio", etc.
+    content:         str
+    timestamp:       float       # Unix timestamp
+    is_group:        bool = False
+    group_jid:       str  = ''
+    media_url:       str  = ''
+    media_mime_type: str  = ''
+    media_filename:  str  = ''
+    quoted_message_id: str = ''
+    latitude:        Optional[float] = None
+    longitude:       Optional[float] = None
+
+
+class NeonizeClient:
+    """
+    Wrapper assíncrono em torno da biblioteca Neonize.
+    Uso:
+        client = NeonizeClient(session_path='/path/to/session.db')
+        client.on_qr      = lambda qr: ...        # qr = base64 PNG
+        client.on_connected  = lambda: ...
+        client.on_message = lambda data: ...       # data = MessageData
+        asyncio.run(client.connect())
+    """
+
+    def __init__(self, session_path: str, tenant_id=None):
+        self.session_path = session_path
+        self.tenant_id    = tenant_id
+        self.client       = None
+        self._connected   = False
+
+        # Callbacks
+        self.on_qr:              Optional[Callable] = None
+        self.on_connected:       Optional[Callable] = None
+        self.on_disconnected:    Optional[Callable] = None
+        self.on_message:         Optional[Callable] = None
+        self.on_message_status:  Optional[Callable] = None
+
+    @property
+    def is_connected(self):
+        return self._connected
+
+    async def connect(self):
+        from neonize.client import NewClient
+        from neonize.events import (
+            ConnectedEv, DisconnectedEv, QREv, MessageEv, ReceiptEv,
+        )
+
+        self.client = NewClient(self.session_path)
+
+        @self.client.event(QREv)
+        async def _on_qr(client, event):
+            qr_b64 = event.qr
+            logger.info("QR gerado")
+            if self.on_qr:
+                self.on_qr(qr_b64)
+
+        @self.client.event(ConnectedEv)
+        async def _on_connected(client, event):
+            self._connected = True
+            logger.info("Conectado ao WhatsApp")
+            if self.on_connected:
+                self.on_connected()
+
+        @self.client.event(DisconnectedEv)
+        async def _on_disconnected(client, event):
+            self._connected = False
+            reason = getattr(event, 'Reason', 'unknown')
+            logger.warning(f"Desconectado: {reason}")
+            if self.on_disconnected:
+                self.on_disconnected(str(reason))
+
+        @self.client.event(MessageEv)
+        async def _on_message(client, event):
+            try:
+                info = event.Info
+                msg_type = str(event.Type or 'text').lower()
+
+                content = ''
+                media_url = media_mime = media_filename = ''
+
+                if hasattr(event.Message, 'Conversation'):
+                    content = event.Message.Conversation or ''
+                elif hasattr(event.Message, 'ExtendedTextMessage'):
+                    content = (event.Message.ExtendedTextMessage.Text or '')
+
+                # Mídia
+                if msg_type in ('image', 'video', 'audio', 'document', 'sticker'):
+                    try:
+                        media_data = await client.Download(event.Message)
+                        # Salve media_data em storage e gere URL
+                        # media_url = save_media(media_data, msg_type)
+                    except Exception as e:
+                        logger.warning(f"Erro ao baixar mídia: {e}")
+
+                data = MessageData(
+                    message_id=info.ID or '',
+                    jid=str(info.Sender or info.Chat or ''),
+                    phone=str(info.Sender or '').split('@')[0],
+                    push_name=str(event.PushName or ''),
+                    message_type=msg_type,
+                    content=content.strip(),
+                    timestamp=float(info.Timestamp or 0),
+                    is_group=bool(info.IsGroup),
+                    group_jid=str(info.Chat) if info.IsGroup else '',
+                    media_url=media_url,
+                    media_mime_type=media_mime,
+                    media_filename=media_filename,
+                )
+
+                if self.on_message:
+                    self.on_message(data)
+
+            except Exception as e:
+                logger.exception(f"Erro ao processar mensagem: {e}")
+
+        @self.client.event(ReceiptEv)
+        async def _on_receipt(client, event):
+            if self.on_message_status:
+                self.on_message_status(str(event.MessageID), str(event.Type))
+
+        await self.client.connect()
+
+    async def send_text(self, jid: str, text: str) -> str:
+        """Envia texto. Retorna message_id."""
+        result = await self.client.SendMessage(jid, text)
+        return str(result.ID) if result else ''
+
+    async def send_image(self, jid: str, image_bytes: bytes, caption='') -> str:
+        from neonize.proto.waE2E.WAWebProtobufsE2E_pb2 import ImageMessage
+        msg = ImageMessage(Caption=caption)
+        result = await self.client.SendImage(jid, image_bytes, msg)
+        return str(result.ID) if result else ''
+
+    async def send_audio(self, jid: str, audio_bytes: bytes, ptt=False) -> str:
+        from neonize.proto.waE2E.WAWebProtobufsE2E_pb2 import AudioMessage
+        msg = AudioMessage(PTT=ptt)
+        result = await self.client.SendAudio(jid, audio_bytes, msg)
+        return str(result.ID) if result else ''
+
+    async def send_document(self, jid: str, doc_bytes: bytes, filename='document') -> str:
+        from neonize.proto.waE2E.WAWebProtobufsE2E_pb2 import DocumentMessage
+        msg = DocumentMessage(FileName=filename)
+        result = await self.client.SendDocument(jid, doc_bytes, msg)
+        return str(result.ID) if result else ''
+
+    async def disconnect(self):
+        if self.client:
+            try:
+                await self.client.Disconnect()
+            except Exception:
+                pass
+        self._connected = False
+```
+
+---
+
+## 3. WhatsApp Manager (whatsapp_manager.py)
+
+```python
+import asyncio, secrets, threading, time, logging
+from typing import Dict, Optional, Callable
+
+logger = logging.getLogger(__name__)
+
+
+class WhatsAppManager:
+    """
+    Singleton que gerencia TODAS as instâncias ativas.
+    Thread-safe. Uma thread por instância.
+    """
+
+    _instance = None
+    _lock     = threading.Lock()
+
+    def __new__(cls):
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = super().__new__(cls)
+                    cls._instance._init()
+        return cls._instance
+
+    def _init(self):
+        from .services.neonize_client import NeonizeClient
+        self._NeonizeClient = NeonizeClient
+
+        self.clients:    Dict[str, 'NeonizeClient'] = {}
+        self.threads:    Dict[str, threading.Thread] = {}
+        self._tokens:    Dict[str, str] = {}         # instance_id → token
+        self._last_connect: Dict[str, float] = {}
+        self._msg_ids:   Dict[str, float] = {}       # dedup
+        self._msg_lock   = threading.Lock()
+        self._qr_events: Dict[str, threading.Event] = {}
+        self._qr_codes:  Dict[str, str] = {}
+
+    # ── Conexão ──────────────────────────────────────────────────────────────
+
+    def connect_instance(self, instance_id: str, session_path: str,
+                         on_qr=None, on_connected=None,
+                         on_message=None, on_disconnected=None):
+        """
+        Conecta uma instância em background thread.
+        Rate limit: máx 1 tentativa a cada 30s por instância.
+        """
+        iid = str(instance_id)
+
+        # Rate limit
+        if time.time() - self._last_connect.get(iid, 0) < 30:
+            logger.warning(f"Rate limit atingido: {iid}")
+            return
+        self._last_connect[iid] = time.time()
+
+        # Token garante que callbacks stale sejam ignorados
+        token = secrets.token_hex(16)
+        self._tokens[iid] = token
+        event = threading.Event()
+        self._qr_events[iid] = event
+
+        client = self._NeonizeClient(session_path)
+
+        def _on_qr(qr_b64):
+            if self._tokens.get(iid) != token:
+                return
+            self._qr_codes[iid] = qr_b64
+            event.set()
+            if on_qr:
+                on_qr(qr_b64)
+
+        def _on_connected():
+            if self._tokens.get(iid) != token:
+                return
+            self._qr_codes.pop(iid, None)
+            event.set()
+            if on_connected:
+                on_connected()
+
+        def _on_message(data):
+            if self._tokens.get(iid) != token:
+                return
+            mid = data.message_id
+            now = time.time()
+            with self._msg_lock:
+                if mid and mid in self._msg_ids and now - self._msg_ids[mid] < 5:
+                    logger.debug(f"Msg duplicada ignorada: {mid}")
+                    return
+                if mid:
+                    self._msg_ids[mid] = now
+            if on_message:
+                on_message(data)
+
+        def _on_disconnected(reason):
+            if self._tokens.get(iid) != token:
+                return
+            if on_disconnected:
+                on_disconnected(reason)
+
+        client.on_qr           = _on_qr
+        client.on_connected    = _on_connected
+        client.on_message      = _on_message
+        client.on_disconnected = _on_disconnected
+
+        self.clients[iid] = client
+
+        def _run():
+            try:
+                asyncio.run(client.connect())
+            except Exception as e:
+                logger.exception(f"Erro na thread de {iid}: {e}")
+
+        t = threading.Thread(target=_run, name=f'WA-{iid[:8]}', daemon=False)
+        self.threads[iid] = t
+        t.start()
+
+        return event   # Caller pode esperar pelo QR
+
+    def disconnect_instance(self, instance_id: str):
+        iid = str(instance_id)
+        client = self.clients.pop(iid, None)
+        if client and client.is_connected:
+            try:
+                asyncio.run(client.disconnect())
+            except Exception:
+                pass
+        self._tokens.pop(iid, None)
+        self._qr_codes.pop(iid, None)
+
+    def get_client(self, instance_id: str):
+        return self.clients.get(str(instance_id))
+
+    def get_qr_code(self, instance_id: str) -> Optional[str]:
+        return self._qr_codes.get(str(instance_id))
+
+    def wait_for_qr(self, instance_id: str, timeout=25) -> Optional[str]:
+        """Aguarda QR code ficar disponível (máx timeout segundos)."""
+        event = self._qr_events.get(str(instance_id))
+        if event:
+            event.wait(timeout=timeout)
+            event.clear()
+        return self.get_qr_code(instance_id)
+
+    def startup_reconnect(self):
+        """Chamado no startup do Django. Reconecta instâncias que estavam ativas."""
+        try:
+            from .models import WhatsAppInstance
+            from .services.message_handler import MessageHandler
+            from apps.tenants.models import Tenant
+
+            for inst in WhatsAppInstance.objects.filter(
+                api_type='internal',
+                status__in=['connected', 'connecting'],
+            ).select_related('tenant'):
+
+                def make_callbacks(i):
+                    def on_msg(data):
+                        handler = MessageHandler(i.tenant, i)
+                        handler.handle_incoming_message(data)
+                    def on_conn():
+                        i.update_status('connected', 'Reconectado')
+                    def on_disc(reason):
+                        i.update_status('disconnected', reason)
+                    return on_msg, on_conn, on_disc
+
+                on_msg, on_conn, on_disc = make_callbacks(inst)
+                self.connect_instance(
+                    str(inst.id), inst.get_session_path(),
+                    on_message=on_msg, on_connected=on_conn, on_disconnected=on_disc
+                )
+                logger.info(f"Reconectando: {inst.name}")
+        except Exception as e:
+            logger.exception(f"Erro no startup_reconnect: {e}")
+
+
+# Singleton global
+whatsapp_manager = WhatsAppManager()
+```
+
+---
+
+## 4. Análise de Sentimento (services/sentiment.py)
+
+```python
+import re, json, logging, requests
+
+logger = logging.getLogger(__name__)
+
+GEMINI_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/models/"
+    "gemini-2.5-flash:generateContent"
+)
+
+PROMPT = (
+    "Analise o sentimento desta mensagem de cliente em português e responda SOMENTE com JSON: "
+    '{"sentiment": "positive|negative|neutral", "reason": "motivo breve em até 80 chars"}'
+    "\n\nMensagem: {text}"
+)
+
+POSITIVE_WORDS = [
+    'obrigado','obrigada','ótimo','excelente','perfeito','adorei','amei',
+    'maravilhoso','incrível','gostei','show','top','rápido','bom','boa',
+    'muito bom','parabéns','satisfeito','satisfeita','recebi','chegou',
+]
+NEGATIVE_WORDS = [
+    'ruim','péssimo','horrível','insatisfeito','reclamação','problema',
+    'erro','falha','urgente','atrasado','atraso','não chegou','cancelar',
+    'devolver','defeito','quebrou','não funciona','decepcionado','absurdo',
+    'raiva','irritado','péssima','demora','demora','lento','lenta',
+]
+
+
+def analyze_sentiment(text: str, api_key: str) -> dict | None:
+    """
+    Retorna {'sentiment': 'positive'|'negative'|'neutral', 'reason': str}
+    ou None se não conseguir analisar.
+    """
+    if not text or len(text.strip()) < 5:
+        return {'sentiment': 'neutral', 'reason': 'mensagem muito curta'}
+
+    # 1. Tenta Gemini
+    if api_key:
+        result = _try_gemini(text, api_key)
+        if result:
+            return result
+
+    # 2. Fallback por palavras-chave
+    return _keyword_fallback(text)
+
+
+def _try_gemini(text: str, api_key: str) -> dict | None:
+    try:
+        payload = {
+            "contents": [{"parts": [{"text": PROMPT.format(text=text[:500])}]}],
+            "generationConfig": {"temperature": 0, "maxOutputTokens": 200},
+        }
+        resp = requests.post(
+            GEMINI_URL,
+            headers={"X-goog-api-key": api_key, "Content-Type": "application/json"},
+            json=payload,
+            timeout=10,
+        )
+
+        if resp.status_code in (429, 503):
+            return None   # Rate limit → usa fallback
+
+        resp.raise_for_status()
+        raw = resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+
+        # Remove markdown ```json ... ```
+        raw = re.sub(r'^```(?:json)?\s*', '', raw, flags=re.MULTILINE)
+        raw = re.sub(r'```\s*$', '', raw, flags=re.MULTILINE)
+
+        obj = json.loads(raw)
+        s = obj.get('sentiment', 'neutral').lower()
+        if s not in ('positive', 'negative', 'neutral'):
+            s = 'neutral'
+        return {'sentiment': s, 'reason': str(obj.get('reason', ''))[:200]}
+
+    except Exception as e:
+        logger.debug(f"Gemini falhou: {e}")
+        return None
+
+
+def _keyword_fallback(text: str) -> dict:
+    low = text.lower()
+    pos = sum(1 for w in POSITIVE_WORDS if w in low)
+    neg = sum(1 for w in NEGATIVE_WORDS if w in low)
+
+    if neg > pos:
+        return {'sentiment': 'negative', 'reason': 'palavras negativas detectadas'}
+    elif pos > neg:
+        return {'sentiment': 'positive', 'reason': 'palavras positivas detectadas'}
+    return {'sentiment': 'neutral', 'reason': 'sem indicadores claros'}
+```
+
+---
+
+## 5. Message Handler (services/message_handler.py)
+
+```python
+import logging
+from datetime import datetime
+from django.db import transaction
+from django.utils import timezone
+
+from ..models import WhatsAppContact, Conversation, Message, WhatsAppInstance
+from .neonize_client import MessageData
+from .sentiment import analyze_sentiment
+
+logger = logging.getLogger(__name__)
+
+
+class MessageHandler:
+
+    def __init__(self, tenant, instance: WhatsAppInstance = None):
+        self.tenant   = tenant
+        self.instance = instance
+
+    @transaction.atomic
+    def handle_incoming_message(self, data: MessageData) -> Message | None:
+        """
+        Fluxo completo de mensagem recebida:
+        1. Ignora grupos
+        2. Cria/atualiza contato
+        3. Cria/recupera conversa
+        4. Cria Message no banco
+        5. Atualiza cache da conversa
+        6. Analisa sentimento (inline, sem Celery)
+        7. Gera resposta de IA (se habilitado)
+        """
+
+        # 1. Ignora grupos
+        if data.is_group:
+            return None
+
+        # 2. Contato
+        contact = self._get_or_create_contact(data)
+
+        # 3. Conversa
+        conversation = self._get_or_create_conversation(contact)
+
+        # Evita mensagem duplicada pelo message_id
+        if data.message_id and Message.objects.filter(
+            conversation=conversation, message_id=data.message_id
+        ).exists():
+            return None
+
+        # 4. Cria mensagem
+        ts = datetime.fromtimestamp(data.timestamp, tz=timezone.utc) if data.timestamp else timezone.now()
+        message = Message.objects.create(
+            conversation=conversation,
+            message_id=data.message_id or '',
+            message_type=data.message_type or 'text',
+            content=data.content,
+            sender_type='contact',
+            status='delivered',
+            timestamp=ts,
+            media_url=data.media_url or '',
+            media_mime_type=data.media_mime_type or '',
+            media_filename=data.media_filename or '',
+            latitude=data.latitude,
+            longitude=data.longitude,
+        )
+
+        # 5. Atualiza cache da conversa
+        conversation.last_message_text         = data.content[:500]
+        conversation.last_message_at           = ts
+        conversation.last_message_from_contact = True
+        conversation.unread_count              = conversation.unread_count + 1
+        conversation.message_count             = conversation.message_count + 1
+        update_fields = [
+            'last_message_text', 'last_message_at', 'last_message_from_contact',
+            'unread_count', 'message_count',
+        ]
+
+        # 6. Sentimento
+        if data.content:
+            try:
+                from apps.core.models import SystemSettings
+                gemini_key = SystemSettings.get_settings().gemini_api_key
+            except Exception:
+                gemini_key = ''
+
+            if not gemini_key and self.instance:
+                gemini_key = self.instance.gemini_api_key
+
+            if gemini_key:
+                result = analyze_sentiment(data.content, gemini_key)
+                if result:
+                    message.sentiment = result['sentiment']
+                    message.save(update_fields=['sentiment'])
+                    conversation.last_message_sentiment        = result['sentiment']
+                    conversation.last_message_sentiment_reason = result.get('reason', '')[:200]
+                    update_fields += ['last_message_sentiment', 'last_message_sentiment_reason']
+
+        conversation.save(update_fields=update_fields)
+
+        # 7. IA (implemente conforme seu AI agent)
+        # self._generate_ai_response(message, conversation)
+
+        return message
+
+    def _get_or_create_contact(self, data: MessageData) -> WhatsAppContact:
+        phone_norm = self._normalize_phone(data.phone)
+        contact, created = WhatsAppContact.objects.update_or_create(
+            tenant=self.tenant,
+            jid=data.jid,
+            defaults={
+                'phone': data.phone,
+                'phone_normalized': phone_norm,
+                'push_name': data.push_name or '',
+            },
+        )
+        if created:
+            self._link_to_lead(contact, phone_norm)
+        return contact
+
+    def _get_or_create_conversation(self, contact: WhatsAppContact) -> Conversation:
+        conv = Conversation.objects.filter(
+            tenant=self.tenant,
+            contact=contact,
+            status__in=['open', 'pending', 'in_progress'],
+        ).first()
+
+        if not conv:
+            conv = Conversation.objects.create(
+                tenant=self.tenant,
+                instance=self.instance,
+                contact=contact,
+                lead=contact.lead,
+                channel='whatsapp',
+                status='open',
+            )
+
+        return conv
+
+    def _link_to_lead(self, contact: WhatsAppContact, phone_norm: str):
+        """Vincula contato ao Lead do CRM pelo telefone."""
+        try:
+            from apps.crm.models import Lead
+            lead = Lead.objects.filter(
+                tenant=self.tenant,
+                phone_normalized=phone_norm,
+                is_active=True,
+            ).first()
+            if lead:
+                contact.lead = lead
+                contact.save(update_fields=['lead'])
+        except Exception as e:
+            logger.warning(f"Erro ao vincular lead: {e}")
+
+    @staticmethod
+    def _normalize_phone(phone: str) -> str:
+        import re
+        return re.sub(r'\D', '', phone or '')
+
+    def create_outgoing_message(self, conversation: Conversation,
+                                content: str, message_type='text',
+                                sender_type='user', sender_user=None,
+                                ai_generated=False, ai_model='', ai_tokens=0,
+                                media_url='', media_mime_type='',
+                                media_filename='') -> Message:
+        message = Message.objects.create(
+            conversation=conversation,
+            message_type=message_type,
+            content=content,
+            sender_type=sender_type,
+            sender_user=sender_user,
+            status='pending',
+            ai_generated=ai_generated,
+            ai_model=ai_model,
+            ai_tokens_used=ai_tokens,
+            media_url=media_url,
+            media_mime_type=media_mime_type,
+            media_filename=media_filename,
+        )
+
+        ts = timezone.now()
+        conversation.last_message_text         = content[:500]
+        conversation.last_message_at           = ts
+        conversation.last_message_from_contact = False
+        conversation.message_count             = conversation.message_count + 1
+        if conversation.first_response_at is None:
+            conversation.first_response_at = ts
+            conversation.save(update_fields=[
+                'last_message_text', 'last_message_at', 'last_message_from_contact',
+                'message_count', 'first_response_at',
+            ])
+        else:
+            conversation.save(update_fields=[
+                'last_message_text', 'last_message_at', 'last_message_from_contact',
+                'message_count',
+            ])
+
+        return message
+```
+
+---
+
+## 6. ChatPRO Webhook (chatpro_webhook.py)
+
+```python
+import re, json, logging
+from django.views.decorators.csrf import csrf_exempt
+from django.views.decorators.http import require_POST
+from django.http import JsonResponse
+
+logger = logging.getLogger(__name__)
+
+# Eventos ignorados
+IGNORED_EVENTS = {
+    'sent_message', 'transfer_session', 'session_closed', 'session_paused',
+}
+
+# Tipos de mídia (sem texto)
+MEDIA_TYPES = {
+    'receveid_audio_message': '🎤 Áudio',
+    'receveid_image_message': '📷 Imagem',
+    'receveid_video_message': '📹 Vídeo',
+    'receveid_document_message': '📄 Documento',
+    'receveid_sticker_message': '🎭 Sticker',
+}
+
+
+@csrf_exempt
+@require_POST
+def chatpro_webhook(request, token: str):
+    """
+    Recebe mensagens do ChatPRO e salva no CRM.
+
+    URL: /api/webhooks/chatpro/<token>/
+
+    Payload esperado:
+    {
+        "event": "received_message",
+        "message_data": {
+            "id": "ABC123",
+            "from_me": false,
+            "number": "5521999999999@s.whatsapp.net",
+            "message": "Olá",
+            "type": "receveid_message",
+            "push_name": "João"
+        }
+    }
+    """
+    from .models import WhatsAppInstance
+    from apps.crm.models import (
+        Lead, LeadSource, LeadActivity, LeadNote,
+        LeadOpportunity, Pipeline,
+    )
+
+    # 1. Valida token
+    try:
+        instance = WhatsAppInstance.objects.select_related('tenant').get(
+            chatpro_webhook_token=token,
+            api_type='chatpro',
+        )
+    except WhatsAppInstance.DoesNotExist:
+        return JsonResponse({'error': 'invalid token'}, status=401)
+
+    tenant = instance.tenant
+
+    # 2. Parse do payload
+    try:
+        data = json.loads(request.body)
+    except (json.JSONDecodeError, Exception):
+        return JsonResponse({'error': 'invalid json'}, status=400)
+
+    event    = data.get('event', '')
+    msg_data = data.get('message_data') or {}
+
+    # 3. Ignora eventos desnecessários
+    if event in IGNORED_EVENTS:
+        return JsonResponse({'ok': True, 'skipped': True})
+
+    # 4. Ignora mensagens do próprio número
+    if msg_data.get('from_me') is True:
+        return JsonResponse({'ok': True, 'skipped': True, 'reason': 'from_me'})
+
+    # 5. Extrai dados
+    number_raw    = msg_data.get('number') or msg_data.get('participant') or ''
+    phone_norm    = re.sub(r'\D', '', number_raw)
+    body          = str(msg_data.get('message') or '').strip()
+    msg_type      = msg_data.get('type', '')
+    msg_id        = msg_data.get('id', '')
+    push_name     = msg_data.get('push_name') or ''
+
+    # 6. Ignora se sem conteúdo nem mídia reconhecida
+    is_media = not body and msg_type in MEDIA_TYPES
+    if not body and not is_media:
+        return JsonResponse({'ok': True, 'skipped': True})
+
+    if not phone_norm:
+        return JsonResponse({'error': 'missing number'}, status=400)
+
+    try:
+        # 7. Deduplicação por msg_id
+        if msg_id and LeadActivity.objects.filter(
+            metadata__chatpro_msg_id=msg_id
+        ).exists():
+            return JsonResponse({'ok': True, 'skipped': True, 'reason': 'duplicate'})
+
+        # 8. Cria ou recupera Lead
+        lead = Lead.objects.filter(
+            tenant=tenant,
+            phone_normalized=phone_norm,
+            is_active=True,
+        ).first()
+
+        if not lead:
+            pipeline = Pipeline.objects.filter(tenant=tenant).order_by('id').first()
+            if not pipeline:
+                return JsonResponse({'error': 'no pipeline'}, status=500)
+
+            stage = pipeline.stages.order_by('order').first()
+            if not stage:
+                return JsonResponse({'error': 'no stage'}, status=500)
+
+            source, _ = LeadSource.objects.get_or_create(
+                tenant=tenant,
+                slug='whatsapp',
+                defaults={'name': 'WhatsApp'},
+            )
+
+            lead = Lead.objects.create(
+                tenant=tenant,
+                name=push_name or f'WhatsApp {phone_norm[-4:]}',
+                phone=phone_norm,
+                source=source,
+                pipeline=pipeline,
+                stage=stage,
+                temperature='warm',
+            )
+
+            # Oportunidade para aparecer no Kanban
+            LeadOpportunity.objects.create(
+                lead=lead,
+                stage=stage,
+                notes=f'Origem: ChatPRO. "{body[:200]}"',
+            )
+
+            LeadActivity.objects.create(
+                lead=lead,
+                activity_type='created',
+                description=f'Lead criado via ChatPRO webhook.',
+            )
+
+        # 9. Salva nota com a mensagem
+        if body:
+            LeadNote.objects.create(
+                lead=lead,
+                content=f'📱 WhatsApp (ChatPRO):\n{body}',
+            )
+            activity_desc = body[:500]
+        else:
+            activity_desc = MEDIA_TYPES.get(msg_type, f'Mídia ({msg_type})')
+
+        # 10. Registra atividade (usado também para dedup por msg_id)
+        LeadActivity.objects.create(
+            lead=lead,
+            activity_type='whatsapp_received',
+            description=activity_desc,
+            metadata={
+                'chatpro_msg_id': msg_id,
+                'number': number_raw,
+                'event': event,
+            },
+        )
+
+        return JsonResponse({'ok': True, 'lead_id': lead.id})
+
+    except Exception as e:
+        logger.exception(f'ChatPRO webhook error: {e}')
+        return JsonResponse({'error': 'internal error'}, status=500)
+```
+
+---
+
+## 7. Signals (signals.py)
+
+```python
+from django.db.models.signals import post_save
+from django.dispatch import receiver
+
+
+@receiver(post_save, sender='tenants.Tenant')
+def create_default_department(sender, instance, created, **kwargs):
+    """Cria departamento 'Geral' automaticamente para novos tenants."""
+    if not created:
+        return
+    try:
+        from .models import Department, UserDepartment
+        dept = Department.objects.create(
+            tenant=instance,
+            name='Geral',
+            is_default=True,
+            color='#6366f1',
+        )
+        owner = instance.get_owner()
+        if owner:
+            UserDepartment.objects.create(
+                user=owner, department=dept, is_supervisor=True
+            )
+    except Exception:
+        pass
+```
+
+---
+
+## 8. URLs (urls.py)
+
+```python
+from django.urls import path
+from . import views
+from .chatpro_webhook import chatpro_webhook
+
+app_name = 'whatsapp'
+
+urlpatterns = [
+    # Central de Atendimento
+    path('',                             views.inbox,                     name='inbox'),
+    path('conversas/',                   views.conversation_list,         name='conversation_list'),
+    path('conversa/<int:pk>/',           views.conversation_detail,       name='conversation_detail'),
+    path('conversa/<int:pk>/enviar/',    views.send_message,              name='send_message'),
+    path('conversa/<int:pk>/audio/',     views.send_audio,                name='send_audio'),
+    path('conversa/<int:pk>/imagem/',    views.send_image,                name='send_image'),
+    path('conversa/<int:pk>/acao/',      views.conversation_action,       name='conversation_action'),
+
+    # API de atualização (polling)
+    path('api/conversas/',                             views.api_conversations_list),
+    path('api/conversa/<int:pk>/mensagens/',           views.api_new_messages),
+    path('api/conversa/<int:pk>/lidas/',               views.api_mark_read),
+
+    # Instâncias
+    path('instancias/',                        views.instance_list,      name='instance_list'),
+    path('api/instancia/',                     views.instance_create),
+    path('api/instancia/<uuid:pk>/',           views.instance_detail),
+    path('api/instancia/<uuid:pk>/delete/',    views.instance_delete),
+    path('api/instancia/<uuid:pk>/connect/',   views.instance_connect),
+    path('api/instancia/<uuid:pk>/disconnect/',views.instance_disconnect),
+    path('api/instancia/<uuid:pk>/status/',    views.instance_status),
+
+    # Departamentos
+    path('departamentos/',                     views.department_list,    name='department_list'),
+    path('api/departamento/',                  views.department_create),
+    path('api/departamento/<int:pk>/',         views.department_update),
+    path('api/departamento/<int:pk>/delete/',  views.department_delete),
+
+    # Templates & Quick Replies
+    path('templates/',                         views.template_list,      name='template_list'),
+    path('api/template/',                      views.template_create),
+    path('api/quick-reply/',                   views.quick_reply_create),
+    path('api/quick-reply/<int:pk>/delete/',   views.quick_reply_delete),
+
+    # Contatos
+    path('contatos/',                          views.contact_list,       name='contact_list'),
+    path('contato/<int:pk>/vincular/',         views.contact_link_lead),
+
+    # Tags
+    path('tags/',                              views.tag_list,           name='tag_list'),
+    path('api/tag/',                           views.tag_create),
+    path('api/tag/<int:pk>/delete/',           views.tag_delete),
+
+    # Iniciar conversa a partir de Lead do CRM
+    path('iniciar/<int:lead_id>/',             views.start_from_lead),
+]
+
+# URL pública do webhook ChatPRO (adicionar no urls.py raiz)
+# path('api/webhooks/chatpro/<str:token>/', chatpro_webhook, name='webhook_chatpro'),
+```
+
+---
+
+## 9. Apps.py (startup)
+
+```python
+from django.apps import AppConfig
+
+
+class WhatsappConfig(AppConfig):
+    name = 'apps.whatsapp'
+    verbose_name = 'Central de Atendimento WhatsApp'
+
+    def ready(self):
+        import apps.whatsapp.signals  # noqa
+        # Reconecta instâncias que estavam ativas antes do restart
+        try:
+            from .whatsapp_manager import whatsapp_manager
+            whatsapp_manager.startup_reconnect()
+        except Exception:
+            pass
+```
+
+---
+
+## 10. Views — Instâncias e QR Code (views.py — trecho)
+
+```python
+import json, asyncio
+from django.contrib.auth.decorators import login_required
+from django.views.decorators.http import require_POST
+from django.http import JsonResponse
+from django.shortcuts import render, get_object_or_404
+from django.views.decorators.csrf import csrf_exempt
+
+from .models import WhatsAppInstance, Conversation, Message
+from .whatsapp_manager import whatsapp_manager
+from .services.message_handler import MessageHandler
+
+
+# ── QR Code / Conexão ────────────────────────────────────────────────────────
+
+@login_required
+def instance_list(request):
+    instances = WhatsAppInstance.objects.filter(tenant=request.tenant).order_by('name')
+    return render(request, 'whatsapp/instance_list.html', {'instances': instances})
+
+
+@login_required
+@require_POST
+def instance_create(request):
+    data = json.loads(request.body)
+    inst = WhatsAppInstance.objects.create(
+        tenant=request.tenant,
+        name=data.get('name', 'Nova Instância'),
+        api_type=data.get('api_type', 'internal'),
+    )
+    return JsonResponse({'success': True, 'id': str(inst.id)})
+
+
+@login_required
+@require_POST
+def instance_connect(request, pk):
+    """
+    BLOQUEANTE: aguarda QR code (até 25s).
+    Frontend recebe QR direto na resposta HTTP.
+    """
+    inst = get_object_or_404(WhatsAppInstance, pk=pk, tenant=request.tenant)
+
+    # Se já conectado
+    if inst.status == 'connected':
+        return JsonResponse({'success': True, 'status': 'connected'})
+
+    inst.update_status('connecting', 'Iniciando conexão...')
+
+    def on_qr(qr_b64):
+        inst.set_qr_code(qr_b64)
+
+    def on_connected():
+        inst.update_status('connected', 'Conectado')
+
+    def on_disconnected(reason):
+        inst.update_status('disconnected', reason)
+
+    def on_message(data):
+        inst.refresh_from_db()
+        handler = MessageHandler(inst.tenant, inst)
+        handler.handle_incoming_message(data)
+        inst.increment_messages(received=1)
+
+    event = whatsapp_manager.connect_instance(
+        str(inst.id), inst.get_session_path(),
+        on_qr=on_qr,
+        on_connected=on_connected,
+        on_message=on_message,
+        on_disconnected=on_disconnected,
+    )
+
+    # Aguarda QR ou conexão (máx 25s)
+    qr = whatsapp_manager.wait_for_qr(str(inst.id), timeout=25)
+
+    if qr:
+        return JsonResponse({'success': True, 'status': 'qr_code', 'qr_code': qr})
+
+    inst.refresh_from_db()
+    if inst.status == 'connected':
+        return JsonResponse({'success': True, 'status': 'connected'})
+
+    return JsonResponse({'success': False, 'error': 'timeout generating QR'}, status=408)
+
+
+@login_required
+@require_POST
+def instance_disconnect(request, pk):
+    inst = get_object_or_404(WhatsAppInstance, pk=pk, tenant=request.tenant)
+    whatsapp_manager.disconnect_instance(str(inst.id))
+    inst.update_status('disconnected', 'Desconectado manualmente')
+    return JsonResponse({'success': True})
+
+
+@login_required
+def instance_status(request, pk):
+    inst = get_object_or_404(WhatsAppInstance, pk=pk, tenant=request.tenant)
+    return JsonResponse({
+        'status': inst.status,
+        'phone_number': inst.phone_number,
+        'messages_sent': inst.messages_sent,
+        'messages_received': inst.messages_received,
+    })
+
+
+# ── Envio de mensagens ───────────────────────────────────────────────────────
+
+@login_required
+@require_POST
+def send_message(request, pk):
+    """Envia texto ou mídia por uma conversa."""
+    conv = get_object_or_404(Conversation, pk=pk, tenant=request.tenant)
+    data = json.loads(request.body)
+
+    content   = data.get('content', '').strip()
+    msg_type  = data.get('type', 'text')
+
+    if not content:
+        return JsonResponse({'error': 'empty message'}, status=400)
+
+    handler = MessageHandler(request.tenant)
+    msg = handler.create_outgoing_message(
+        conversation=conv,
+        content=content,
+        message_type=msg_type,
+        sender_type='user',
+        sender_user=request.user,
+    )
+
+    # Envio real via Neonize
+    inst = conv.instance
+    if inst and inst.status == 'connected':
+        client = whatsapp_manager.get_client(str(inst.id))
+        if client and client.is_connected:
+            jid = conv.contact.jid
+            try:
+                wa_id = asyncio.run(client.send_text(jid, content))
+                msg.message_id = wa_id
+                msg.status     = 'sent'
+                msg.save(update_fields=['message_id', 'status'])
+                inst.increment_messages(sent=1)
+            except Exception as e:
+                msg.status = 'failed'
+                msg.save(update_fields=['status'])
+
+    return JsonResponse({
+        'success': True,
+        'message_id': msg.id,
+        'status': msg.status,
+    })
+
+
+# ── API de polling ────────────────────────────────────────────────────────────
+
+@login_required
+def api_conversations_list(request):
+    """Lista conversas com status calculado — usado pelo frontend Alpine.js."""
+    convs = (
+        Conversation.objects
+        .filter(tenant=request.tenant, is_archived=False)
+        .select_related('contact', 'assigned_to', 'department')
+        .order_by('-last_message_at')[:200]
+    )
+    data = []
+    for c in convs:
+        data.append({
+            'id':                    c.id,
+            'contact_name':          c.contact.display_name,
+            'contact_phone':         c.contact.phone,
+            'last_message_text':     c.last_message_text,
+            'last_message_at':       c.last_message_at.isoformat() if c.last_message_at else '',
+            'status':                c.status,
+            'effective_status':      c.effective_status,
+            'unread_count':          c.unread_count,
+            'ai_enabled':            c.ai_enabled,
+            'assigned_to_id':        c.assigned_to_id,
+            'department_id':         c.department_id,
+            'last_message_sentiment': c.last_message_sentiment,
+            'is_mine':               c.assigned_to_id == request.user.id,
+        })
+    return JsonResponse({'conversations': data})
+```
+
+---
+
+## 11. Template inbox.html (estrutura Alpine.js)
+
+```html
+{% extends "base.html" %}
+{% block content %}
+<div x-data="inboxApp()" x-init="init()" class="flex h-screen">
+
+    <!-- Lista de conversas -->
+    <div class="w-80 flex-shrink-0 border-r flex flex-col">
+        <!-- Filtros -->
+        <input x-model="searchQuery" @input="filter()" placeholder="Buscar...">
+
+        <select x-model="statusFilter" @change="filter()">
+            <option value="">Todos</option>
+            <option value="waiting_service">Novos</option>
+            <option value="waiting_response">Aguardando</option>
+            <option value="in_progress">Em atendimento</option>
+        </select>
+
+        <!-- Cards -->
+        <div class="overflow-y-auto flex-1">
+            <template x-for="c in filtered" :key="c.id">
+                <a :href="'/whatsapp/conversa/' + c.id + '/'"
+                   class="flex items-center gap-3 p-3 hover:bg-gray-50 border-b">
+                    <!-- Avatar -->
+                    <div class="w-10 h-10 rounded-full flex items-center justify-center text-white font-bold"
+                         :style="'background:' + avatarColor(c.contact_name)">
+                        <span x-text="initials(c.contact_name)"></span>
+                    </div>
+                    <!-- Info -->
+                    <div class="flex-1 min-w-0">
+                        <div class="flex items-center justify-between">
+                            <span class="font-semibold text-sm" x-text="c.contact_name"></span>
+                            <!-- Sentimento -->
+                            <span x-show="c.last_message_sentiment === 'positive'" title="Positivo">😊</span>
+                            <span x-show="c.last_message_sentiment === 'negative'" title="Negativo">😠</span>
+                        </div>
+                        <p class="text-xs text-gray-500 truncate" x-text="c.last_message_text || 'Sem mensagens'"></p>
+                    </div>
+                    <!-- Badges -->
+                    <div class="flex flex-col items-end gap-1">
+                        <span x-show="c.unread_count > 0"
+                              x-text="c.unread_count"
+                              class="bg-green-500 text-white text-xs rounded-full px-1.5 py-0.5"></span>
+                        <span x-show="c.effective_status === 'waiting_service'"
+                              class="text-xs bg-blue-100 text-blue-700 px-1.5 rounded">Novo</span>
+                        <span x-show="c.ai_enabled" class="text-xs">🤖</span>
+                    </div>
+                </a>
+            </template>
+        </div>
+    </div>
+
+    <!-- Detalhes (desktop) -->
+    <div class="flex-1 hidden md:flex items-center justify-center text-gray-400">
+        Selecione uma conversa
+    </div>
+</div>
+
+<script>
+function inboxApp() {
+    return {
+        conversations: [],
+        filtered: [],
+        searchQuery: '',
+        statusFilter: '',
+        pollInterval: null,
+
+        async init() {
+            await this.load();
+            this.pollInterval = setInterval(() => this.load(), 10000);
+        },
+
+        async load() {
+            const r = await fetch('/whatsapp/api/conversas/');
+            const d = await r.json();
+            this.conversations = d.conversations || [];
+            this.filter();
+        },
+
+        filter() {
+            let r = [...this.conversations];
+            if (this.statusFilter)
+                r = r.filter(c => c.effective_status === this.statusFilter);
+            if (this.searchQuery) {
+                const q = this.searchQuery.toLowerCase();
+                r = r.filter(c =>
+                    c.contact_name.toLowerCase().includes(q) ||
+                    (c.last_message_text || '').toLowerCase().includes(q) ||
+                    (c.contact_phone || '').includes(q)
+                );
+            }
+            this.filtered = r;
+        },
+
+        avatarColor(name) {
+            const colors = ['#3b82f6','#ef4444','#10b981','#f59e0b','#8b5cf6','#ec4899'];
+            if (!name) return colors[0];
+            return colors[name.charCodeAt(0) % colors.length];
+        },
+        initials(name) {
+            if (!name) return '?';
+            return name.split(' ').slice(0,2).map(w => w[0]).join('').toUpperCase();
+        },
+    };
+}
+</script>
+{% endblock %}
+```
+
+---
+
+## 12. Template instance_list.html — QR Code
+
+```html
+<!-- Modal de QR Code com polling automático -->
+<div id="qr-modal" class="hidden fixed inset-0 bg-black/50 flex items-center justify-center">
+    <div class="bg-white rounded-xl p-6 w-96 text-center">
+        <h3 class="font-bold mb-4">Conectar WhatsApp</h3>
+
+        <!-- Spinner enquanto gera QR -->
+        <div id="qr-spinner" class="py-8">
+            <div class="animate-spin mx-auto w-10 h-10 border-4 border-green-500 border-t-transparent rounded-full"></div>
+            <p class="text-sm text-gray-500 mt-2">Gerando QR Code...</p>
+        </div>
+
+        <!-- QR Code -->
+        <div id="qr-image" class="hidden">
+            <img id="qr-img" class="mx-auto w-64 h-64">
+            <p class="text-sm text-gray-500 mt-2">
+                Expira em <span id="countdown">20</span>s
+            </p>
+            <p class="text-xs text-gray-400 mt-1">Abra o WhatsApp → Dispositivos Conectados → Conectar</p>
+        </div>
+
+        <!-- Conectado -->
+        <div id="qr-connected" class="hidden py-8">
+            <div class="text-green-500 text-5xl mb-2">✓</div>
+            <p class="font-bold text-green-600">Conectado!</p>
+        </div>
+
+        <button onclick="closeQRModal()" class="mt-4 text-sm text-gray-400 hover:text-gray-600">Fechar</button>
+    </div>
+</div>
+
+<script>
+let currentInstanceId = null;
+let pollTimer = null;
+let countdownTimer = null;
+
+async function connectInstance(instanceId) {
+    currentInstanceId = instanceId;
+    document.getElementById('qr-modal').classList.remove('hidden');
+    document.getElementById('qr-spinner').classList.remove('hidden');
+    document.getElementById('qr-image').classList.add('hidden');
+    document.getElementById('qr-connected').classList.add('hidden');
+
+    try {
+        // Chamada BLOQUEANTE — servidor aguarda QR (até 25s)
+        const r = await fetch(`/whatsapp/api/instancia/${instanceId}/connect/`, {method: 'POST'});
+        const data = await r.json();
+
+        document.getElementById('qr-spinner').classList.add('hidden');
+
+        if (data.status === 'connected') {
+            showConnected();
+        } else if (data.qr_code) {
+            showQR(data.qr_code);
+            startPoll();
+        } else {
+            alert('Erro ao gerar QR: ' + (data.error || 'unknown'));
+        }
+    } catch(e) {
+        alert('Erro de conexão: ' + e);
+    }
+}
+
+function showQR(qrBase64) {
+    document.getElementById('qr-image').classList.remove('hidden');
+    document.getElementById('qr-img').src = 'data:image/png;base64,' + qrBase64;
+    startCountdown(20, () => connectInstance(currentInstanceId));  // Auto-refresh
+}
+
+function startCountdown(seconds, onExpire) {
+    clearInterval(countdownTimer);
+    let s = seconds;
+    document.getElementById('countdown').textContent = s;
+    countdownTimer = setInterval(() => {
+        s--;
+        document.getElementById('countdown').textContent = s;
+        if (s <= 0) { clearInterval(countdownTimer); onExpire(); }
+    }, 1000);
+}
+
+function startPoll() {
+    clearInterval(pollTimer);
+    pollTimer = setInterval(async () => {
+        const r = await fetch(`/whatsapp/api/instancia/${currentInstanceId}/status/`);
+        const data = await r.json();
+        if (data.status === 'connected') {
+            clearInterval(pollTimer);
+            clearInterval(countdownTimer);
+            showConnected();
+        }
+    }, 2000);
+}
+
+function showConnected() {
+    document.getElementById('qr-image').classList.add('hidden');
+    document.getElementById('qr-connected').classList.remove('hidden');
+    setTimeout(() => { window.location.reload(); }, 1500);
+}
+
+function closeQRModal() {
+    clearInterval(pollTimer);
+    clearInterval(countdownTimer);
+    document.getElementById('qr-modal').classList.add('hidden');
+}
+</script>
+```
+
+---
+
+## 13. Template conversation_detail.html — Estilo WhatsApp
+
+```html
+<style>
+/* Fundo característico WhatsApp */
+.wa-chat-bg {
+    background-color: #efeae2;
+    background-image: url("data:image/svg+xml,%3Csvg width='60' height='60' xmlns='http://www.w3.org/2000/svg'%3E%3Ccircle cx='30' cy='30' r='1.5' fill='%23d4c5a9' fill-opacity='0.4'/%3E%3C/svg%3E");
+}
+
+/* Bolha recebida (branca, esquerda) */
+.wa-bubble-in {
+    background: #ffffff;
+    color: #111b21;
+    border-radius: 0 8px 8px 8px;
+    position: relative;
+    max-width: 70%;
+}
+.wa-bubble-in::before {
+    content: '';
+    position: absolute;
+    top: 0; left: -8px;
+    border-style: solid;
+    border-width: 0 8px 8px 0;
+    border-color: transparent #ffffff transparent transparent;
+}
+
+/* Bolha enviada (verde, direita) */
+.wa-bubble-out {
+    background: #d9fdd3;
+    color: #111b21;
+    border-radius: 8px 0 8px 8px;
+    position: relative;
+    max-width: 70%;
+}
+.wa-bubble-out::before {
+    content: '';
+    position: absolute;
+    top: 0; right: -8px;
+    border-style: solid;
+    border-width: 8px 8px 0 0;
+    border-color: #d9fdd3 transparent transparent transparent;
+}
+
+.wa-bubble-meta { color: #667781; font-size: 0.65rem; }
+
+/* Dark mode */
+@media (prefers-color-scheme: dark) {
+    .wa-chat-bg { background-color: #0b141a; }
+    .wa-bubble-in  { background: #202c33; color: #e9edef; }
+    .wa-bubble-in::before  { border-color: transparent #202c33 transparent transparent; }
+    .wa-bubble-out { background: #005c4b; color: #e9edef; }
+    .wa-bubble-out::before { border-color: #005c4b transparent transparent transparent; }
+    .wa-bubble-meta { color: #8696a0; }
+}
+</style>
+
+<!-- Container de mensagens -->
+<div class="flex-1 overflow-y-auto p-3 space-y-1 wa-chat-bg" id="messages-container">
+    {% for msg in messages %}
+    {% if msg.sender_type == 'contact' %}
+    <!-- Recebida -->
+    <div class="flex justify-start">
+        <div class="wa-bubble-in p-2 px-3 shadow-sm">
+            {% if msg.message_type == 'image' %}
+                <img src="{{ msg.media_url }}" class="rounded max-w-xs mb-1">
+            {% elif msg.message_type == 'audio' %}
+                <audio controls class="max-w-xs"><source src="{{ msg.media_url }}"></audio>
+            {% elif msg.message_type == 'document' %}
+                <a href="{{ msg.media_url }}" class="flex items-center gap-2 text-blue-600">
+                    📄 {{ msg.media_filename|default:"Documento" }}
+                </a>
+            {% else %}
+                <p class="text-sm whitespace-pre-wrap">{{ msg.content }}</p>
+            {% endif %}
+            <div class="wa-bubble-meta text-right mt-1">
+                {{ msg.timestamp|date:"H:i" }}
+            </div>
+        </div>
+    </div>
+    {% else %}
+    <!-- Enviada (usuário ou IA) -->
+    <div class="flex justify-end">
+        <div class="wa-bubble-out p-2 px-3 shadow-sm">
+            {% if msg.ai_generated %}<span class="text-xs text-gray-400">🤖 IA</span>{% endif %}
+            <p class="text-sm whitespace-pre-wrap">{{ msg.content }}</p>
+            <div class="wa-bubble-meta text-right mt-1">
+                {{ msg.timestamp|date:"H:i" }}
+                {% if msg.status == 'read' %}✓✓{% elif msg.status == 'delivered' %}✓✓{% else %}✓{% endif %}
+            </div>
+        </div>
+    </div>
+    {% endif %}
+    {% endfor %}
+</div>
+
+<!-- Barra de envio -->
+<form id="send-form" class="flex gap-2 p-3 bg-white border-t items-end">
+    {% csrf_token %}
+    <textarea id="msg-input" class="flex-1 border rounded-xl px-3 py-2 resize-none text-sm"
+              rows="1" placeholder="Digite uma mensagem..."
+              onkeydown="handleKey(event)"></textarea>
+
+    <!-- Anexo (mídia) -->
+    <label class="cursor-pointer text-gray-400 hover:text-gray-600">
+        📎
+        <input type="file" class="hidden" onchange="sendMedia(this)">
+    </label>
+
+    <!-- Áudio -->
+    <button type="button" onclick="toggleRecording()" id="audio-btn"
+            class="text-gray-400 hover:text-gray-600">🎤</button>
+
+    <!-- Enviar -->
+    <button type="submit" class="bg-green-500 text-white rounded-full w-9 h-9 flex items-center justify-center">
+        ➤
+    </button>
+</form>
+
+<script>
+// Auto-scroll
+document.getElementById('messages-container').scrollTop = 999999;
+
+// Envio com Enter (Shift+Enter = nova linha)
+function handleKey(e) {
+    if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        document.getElementById('send-form').dispatchEvent(new Event('submit'));
+    }
+}
+
+// Envio via fetch
+document.getElementById('send-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const input = document.getElementById('msg-input');
+    const text  = input.value.trim();
+    if (!text) return;
+
+    input.value = '';
+    input.style.height = 'auto';
+
+    const r = await fetch(window.location.pathname + 'enviar/', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken')},
+        body: JSON.stringify({ content: text, type: 'text' }),
+    });
+    const data = await r.json();
+    if (data.success) {
+        // Adiciona bolha otimisticamente
+        addBubble(text, 'out');
+    }
+});
+
+function addBubble(text, direction) {
+    const container = document.getElementById('messages-container');
+    const div = document.createElement('div');
+    div.className = `flex justify-${direction === 'out' ? 'end' : 'start'} my-0.5`;
+    div.innerHTML = `
+        <div class="wa-bubble-${direction} p-2 px-3 shadow-sm">
+            <p class="text-sm whitespace-pre-wrap">${escapeHtml(text)}</p>
+            <div class="wa-bubble-meta text-right mt-1">
+                ${new Date().toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'})}
+            </div>
+        </div>`;
+    container.appendChild(div);
+    container.scrollTop = container.scrollHeight;
+}
+
+function escapeHtml(t) {
+    return t.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+function getCookie(name) {
+    return document.cookie.split(';').find(c => c.trim().startsWith(name+'='))?.split('=')[1] || '';
+}
+
+// Polling de novas mensagens (5s)
+let lastMsgId = {{ messages.last.id|default:0 }};
+setInterval(async () => {
+    const r = await fetch(`/whatsapp/api/conversa/{{ conversation.id }}/mensagens/?since=${lastMsgId}`);
+    const d = await r.json();
+    (d.messages || []).forEach(m => {
+        addBubble(m.content, m.sender_type === 'contact' ? 'in' : 'out');
+        lastMsgId = Math.max(lastMsgId, m.id);
+    });
+}, 5000);
+
+// Envio de mídia
+async function sendMedia(input) {
+    const file = input.files[0];
+    if (!file) return;
+    const form = new FormData();
+    form.append('file', file);
+    form.append('csrfmiddlewaretoken', getCookie('csrftoken'));
+    const r = await fetch(window.location.pathname + 'imagem/', {method: 'POST', body: form});
+    const d = await r.json();
+    if (d.success) addBubble('📎 ' + file.name, 'out');
+}
+
+// Gravação de áudio
+let mediaRecorder, audioChunks = [];
+async function toggleRecording() {
+    const btn = document.getElementById('audio-btn');
+    if (mediaRecorder?.state === 'recording') {
+        mediaRecorder.stop();
+        btn.textContent = '🎤';
+        return;
+    }
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    mediaRecorder = new MediaRecorder(stream);
+    audioChunks = [];
+    mediaRecorder.ondataavailable = e => audioChunks.push(e.data);
+    mediaRecorder.onstop = async () => {
+        const blob = new Blob(audioChunks, { type: 'audio/webm' });
+        const form = new FormData();
+        form.append('audio', blob, 'audio.webm');
+        form.append('csrfmiddlewaretoken', getCookie('csrftoken'));
+        const r = await fetch(window.location.pathname + 'audio/', {method: 'POST', body: form});
+        const d = await r.json();
+        if (d.success) addBubble('🎤 Áudio', 'out');
+        stream.getTracks().forEach(t => t.stop());
+    };
+    mediaRecorder.start();
+    btn.textContent = '⏹';
+}
+</script>
+```
+
+---
+
+## 14. Settings e configuração
+
+```python
+# settings.py (adicionar)
+
+# Caminho das sessões WhatsApp (um .db por instância)
+WHATSAPP_SESSION_PATH = BASE_DIR / 'whatsapp_sessions'
+
+# Chave Gemini (fallback para SystemSettings no banco)
+GEMINI_API_KEY = env('GEMINI_API_KEY', default='')
+
+# URLs raiz — adicionar junto com as dashboard URLs:
+# path('api/webhooks/chatpro/<str:token>/', chatpro_webhook),
+
+INSTALLED_APPS += ['apps.whatsapp']
+
+# Logging do módulo
+LOGGING['loggers']['apps.whatsapp'] = {
+    'handlers': ['file', 'console'],
+    'level': 'INFO',
+    'propagate': True,
+}
+```
+
+```bash
+# migrations
+python manage.py makemigrations whatsapp
+python manage.py migrate
+
+# Criar pasta de sessões
+mkdir -p whatsapp_sessions
+```
+
+---
+
+## 15. Como configurar token ChatPRO
+
+```python
+# No shell ou migration:
+from apps.whatsapp.models import WhatsAppInstance
+
+inst = WhatsAppInstance.objects.create(
+    tenant=tenant,
+    name="ChatPRO - Vendas",
+    api_type='chatpro',
+)
+token = inst.get_or_create_chatpro_token()
+print(f"URL do webhook: https://seudominio.com/api/webhooks/chatpro/{token}/")
+# Configure essa URL no painel do ChatPRO → Configurações → Webhook
+```
+
+---
+
+## 16. Checklist de implementação
+
+```
+□ 1. pip install neonize requests django celery redis
+□ 2. Copiar models.py — executar makemigrations + migrate
+□ 3. Copiar services/ (neonize_client, message_handler, sentiment)
+□ 4. Copiar whatsapp_manager.py
+□ 5. Copiar urls.py — adicionar include() no urls.py raiz
+□ 6. Copiar chatpro_webhook.py — adicionar URL pública no raiz
+□ 7. Configurar apps.py → ready() com startup_reconnect()
+□ 8. Configurar signals.py
+□ 9. Criar templates/whatsapp/ (inbox, conversation_detail, instance_list)
+□ 10. Definir WHATSAPP_SESSION_PATH e GEMINI_API_KEY no settings
+□ 11. Criar pasta whatsapp_sessions/ com permissão de escrita
+□ 12. Testar conexão: acessar /whatsapp/instancias/ → Nova Instância → Gerar QR
+□ 13. (Opcional) Configurar token ChatPRO e registrar webhook no painel
+□ 14. (Opcional) Configurar chave Gemini para análise de sentimento
+```
+
+---
+
+## 17. Fluxo resumido
+
+```
+ENTRADA (recebida)
+  Neonize MessageEv
+    → WhatsAppManager.on_message (dedup + token check)
+      → MessageHandler.handle_incoming_message
+          → WhatsAppContact (get_or_create)
+          → Conversation (get_or_create)
+          → Message (create)
+          → Sentimento inline (Gemini ou keywords)
+          → IA response (opcional)
+
+SAÍDA (enviada)
+  views.send_message (POST)
+    → MessageHandler.create_outgoing_message
+    → NeonizeClient.send_text (asyncio.run)
+    → Message.status = 'sent'
+
+CHATPRO (webhook externo → CRM)
+  POST /api/webhooks/chatpro/<token>/
+    → Valida token → Extrai phone/body
+    → Lead (get_or_create por phone_normalized)
+    → LeadOpportunity (Kanban)
+    → LeadNote + LeadActivity
+```
+
+---
+
+*Gerado em 10/03/2026 — Vitória CRM*
