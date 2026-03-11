@@ -1,0 +1,572 @@
+# Guia de Implementação WhatsApp com Neonize em Django
+
+> Versão testada: **Neonize 0.3.15.post0** · Django 5.2 · Python 3.11 (servidor) · Gunicorn 1 worker
+> Autor: gerado com base em implementação real em produção (erp.enwp.com.br)
+
+---
+
+## Índice
+
+1. [O que é o Neonize](#1-o-que-é-o-neonize)
+2. [Instalação](#2-instalação)
+3. [Arquitetura: WhatsAppManager Singleton](#3-arquitetura-whatsappmanager-singleton)
+4. [Envio de Mensagens](#4-envio-de-mensagens)
+   - [Texto](#41-texto)
+   - [Imagem](#42-imagem)
+   - [Áudio PTT (voz)](#43-áudio-ptt-voz)
+5. [Recebimento de Mensagens](#5-recebimento-de-mensagens)
+6. [JIDs — Identificadores WhatsApp](#6-jids--identificadores-whatsapp)
+7. [Problemas Comuns e Soluções](#7-problemas-comuns-e-soluções)
+8. [Deploy com Gunicorn](#8-deploy-com-gunicorn)
+9. [Checklist de Nova Implementação](#9-checklist-de-nova-implementação)
+
+---
+
+## 1. O que é o Neonize
+
+Neonize é uma biblioteca Python que encapsula o binário Go [whatsmeow](https://github.com/tulir/whatsmeow) para conectar ao WhatsApp via WebSocket (sem API oficial). Cada instância mantém uma sessão autenticada via QR code, armazenada em um arquivo SQLite local.
+
+**Características importantes:**
+- Roda em uma **thread dedicada** (bloqueante enquanto conectado)
+- Não é `async/await` — usa callbacks síncronos
+- Sessão salva em `.db` SQLite (cada número = 1 arquivo)
+- Upload de mídia vai direto para o CDN do WhatsApp
+
+---
+
+## 2. Instalação
+
+```bash
+pip install neonize==0.3.15.post0
+```
+
+> No Windows em dev, o Neonize pode falhar (binário Go não compilado para Windows).
+> **Instale apenas no servidor Linux.**
+
+Adicione ao `requirements/base.txt`:
+```
+neonize==0.3.15.post0
+```
+
+Dependências necessárias no servidor:
+```bash
+apt-get install -y ffmpeg libmagic1
+```
+
+No `settings.py`:
+```python
+INSTALLED_APPS = [
+    ...
+    'apps.atendimento',
+]
+
+# Onde ficam os arquivos .db de sessão do Neonize
+WHATSAPP_SESSION_PATH = BASE_DIR / 'whatsapp_sessions'
+```
+
+---
+
+## 3. Arquitetura: WhatsAppManager Singleton
+
+O gerenciador é um **singleton thread-safe** que mantém um dicionário de clientes ativos, um por instância WhatsApp.
+
+### Estrutura de arquivos
+
+```
+apps/atendimento/
+├── whatsapp_manager.py      ← Singleton principal (LEIA ESTA SEÇÃO INTEIRA)
+└── services/
+    ├── neonize_client.py    ← MessageData dataclass + callbacks
+    ├── message_handler.py   ← Processa mensagens recebidas
+    └── sentiment.py         ← Análise de sentimento (Gemini/keywords)
+```
+
+### Como funciona o `connect_instance`
+
+```
+connect_instance(instance_id, session_path, callbacks...)
+    └── Cria Thread daemon "WA-<id>"
+            └── NewClient(session_path).connect()  ← BLOQUEANTE
+                    ├── @client.event.qr          → gera PNG base64, set() no Event
+                    ├── @client.event(PairStatusEv) → usuário escaneou QR
+                    ├── @client.event(ConnectedEv)  → sessão reutilizada
+                    ├── @client.event(MessageEv)    → mensagem recebida
+                    ├── @client.event(ReceiptEv)    → entregue/lido
+                    └── @client.event(DisconnectedEv) → desconectado → auto-reconecta
+```
+
+### Lock de worker único (Gunicorn)
+
+O Neonize não pode rodar em múltiplos workers simultaneamente (duplicaria mensagens e quebraria o SQLite de sessão). Use `fcntl.lockf` para garantir que apenas 1 worker gerencie as conexões:
+
+```python
+def startup_reconnect(self):
+    import fcntl
+    lock_file = '/tmp/neonize_enwp_master.lock'
+    self._master_fd = open(lock_file, 'w')
+    try:
+        fcntl.lockf(self._master_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except IOError:
+        return  # outro worker já tem o lock — não conecta
+    # só o worker que conseguiu o lock conecta as instâncias
+```
+
+> **Sempre use `--workers 1` no Gunicorn** para projetos com Neonize.
+> Com múltiplos workers, cada um tentaria conectar as mesmas instâncias.
+
+---
+
+## 4. Envio de Mensagens
+
+### 4.1 Texto
+
+```python
+def send_text_message(self, instance_id: str, jid: str, text: str) -> str:
+    client = self.clients.get(str(instance_id))
+    if not client:
+        return ''
+    try:
+        jid_obj = _make_jid(jid)
+        result = client.send_message(jid_obj, text)
+        return str(getattr(result, 'ID', None) or '')
+    except Exception as e:
+        logger.exception(f"Erro send_text: {e}")
+        return ''
+```
+
+**Texto funciona com qualquer formato de JID**, incluindo `@lid`. Sem conversão necessária.
+
+---
+
+### 4.2 Imagem
+
+```python
+def send_image_message(self, instance_id: str, jid: str,
+                       image_bytes: bytes, caption='') -> str:
+    client = self.clients.get(str(instance_id))
+    if not client or not client.is_connected:
+        return ''
+    # IMPORTANTE: @lid deve ser convertido para @s.whatsapp.net
+    jid_obj = _resolve_jid(client, jid)
+    try:
+        result = client.send_image(jid_obj, image_bytes, caption=caption or None)
+        return str(getattr(result, 'ID', None) or '')
+    except Exception as e:
+        logger.exception(f"Erro send_image: {e}")
+        return ''
+```
+
+**Pré-requisito:** verificar `client.is_connected` antes de qualquer upload de mídia.
+
+---
+
+### 4.3 Áudio PTT (voz)
+
+Este é o mais complexo. Há dois bugs conhecidos no Neonize 0.3.x que precisam de workaround:
+
+#### Bug 1 — MIME type errado (CRÍTICO)
+`build_audio_message` usa `magic.from_buffer()` que retorna `'audio/ogg'`.
+O WhatsApp PTT **exige** `'audio/ogg; codecs=opus'` para exibir a bolha de voz.
+Sem isso, a mensagem é entregue mas **não aparece** no WhatsApp.
+
+#### Bug 2 — `int("5.406000")` ValueError
+`build_audio_message` faz `int(ffprobe_duration)` onde a duração vem como string float `"5.406000"`.
+Em algumas versões do Neonize isso causa `ValueError`. O workaround está no mesmo código abaixo.
+
+#### Solução: build + patch do MIME type
+
+```python
+def send_audio_message(self, instance_id: str, jid: str,
+                       audio_bytes: bytes, ptt=True) -> str:
+    client = self.clients.get(str(instance_id))
+    if not client or not client.is_connected:
+        return ''
+    # @lid → @s.whatsapp.net (upload de mídia não funciona com @lid)
+    jid_obj = _resolve_jid(client, jid)
+    try:
+        # 1. build_audio_message: faz upload para CDN + calcula duração
+        msg = client.build_audio_message(audio_bytes, ptt=ptt)
+        # 2. CORREÇÃO OBRIGATÓRIA: fix do MIME type
+        #    Neonize retorna 'audio/ogg', WhatsApp exige 'audio/ogg; codecs=opus'
+        msg.audioMessage.mimetype = 'audio/ogg; codecs=opus'
+        # 3. Envia a mensagem já com metadados corretos
+        result = client.send_message(jid_obj, msg)
+        return str(getattr(result, 'ID', None) or '')
+    except Exception as e:
+        logger.exception(f"Erro send_audio: {e}")
+        return ''
+```
+
+#### Formato de áudio aceito pelo WhatsApp
+
+O WhatsApp aceita PTT somente em **OGG/Opus**. Se o usuário gravar no navegador (webm/opus), converta antes de enviar:
+
+```python
+# views.py — converter webm → ogg antes de chamar send_audio_message
+import subprocess, tempfile, os
+
+def _converter_audio(audio_bytes: bytes, fmt_entrada='webm') -> bytes:
+    with tempfile.NamedTemporaryFile(suffix=f'.{fmt_entrada}', delete=False) as f_in:
+        f_in.write(audio_bytes)
+        path_in = f_in.name
+    path_out = path_in.replace(f'.{fmt_entrada}', '.ogg')
+    try:
+        subprocess.run([
+            'ffmpeg', '-y', '-i', path_in,
+            '-c:a', 'libopus', '-b:a', '32k',
+            '-vbr', 'on', '-application', 'voip',
+            path_out
+        ], capture_output=True, check=True, timeout=30)
+        with open(path_out, 'rb') as f:
+            return f.read()
+    finally:
+        for p in (path_in, path_out):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+```
+
+---
+
+## 5. Recebimento de Mensagens
+
+O callback `on_message` recebe um `MessageData` com todos os campos normalizados:
+
+```python
+@dataclass
+class MessageData:
+    message_id: str
+    jid: str           # JID do remetente
+    phone: str         # número limpo (sem @...)
+    push_name: str     # nome salvo no WhatsApp
+    message_type: str  # 'text' | 'image' | 'audio' | 'video' | 'document' | 'sticker'
+    content: str       # texto ou legenda
+    timestamp: float
+    is_group: bool
+    group_jid: str
+    media_mime_type: str
+    media_filename: str
+    media_data: bytes  # bytes brutos da mídia (já baixada)
+```
+
+### Prioridade de detecção de tipo de mensagem
+
+Detecte nessa ordem (o WhatsApp envia apenas 1 tipo por mensagem):
+
+```python
+# 1. imageMessage
+# 2. audioMessage
+# 3. videoMessage
+# 4. documentMessage
+# 5. stickerMessage
+# 6. conversation / extendedTextMessage (texto)
+```
+
+Use `try/except` em cada tentativa — atributos inexistentes no proto retornam objetos vazios mas alguns lançam exceção dependendo da versão.
+
+### Deduplicação obrigatória
+
+Neonize pode entregar a mesma mensagem mais de uma vez (race condition WebSocket). Sempre deduplique por `message_id`:
+
+```python
+with self._msg_lock:
+    if mid and mid in self._msg_ids:
+        return  # duplicata
+    if mid:
+        self._msg_ids[mid] = time.time()
+# limpar mensagens antigas do cache a cada 5 minutos
+```
+
+---
+
+## 6. JIDs — Identificadores WhatsApp
+
+| Formato | Exemplo | Uso |
+|---------|---------|-----|
+| `@s.whatsapp.net` | `5531999887766@s.whatsapp.net` | Contato pessoal — padrão |
+| `@g.us` | `120363...@g.us` | Grupo |
+| `@lid` | `244873366134971@lid` | Local ID (novo formato Meta) |
+
+### O problema do `@lid`
+
+Quando o contato usa a versão mais recente do WhatsApp (com Privacy features), o JID pode vir como `@lid`. **Texto funciona**, mas **upload de mídia falha** com `UploadError: websocket not connected`.
+
+**Solução: converter `@lid` para `@s.whatsapp.net` antes de enviar mídia:**
+
+```python
+def _resolve_jid(client, jid_str: str):
+    from neonize.utils.jid import JID
+    if '@lid' not in jid_str:
+        return _make_jid(jid_str)
+    try:
+        user = jid_str.split('@')[0]
+        lid = JID(User=user, Server='lid', RawAgent=0, Device=0, Integrator=0)
+        pn_jid = client.get_pn_from_lid(lid)
+        if pn_jid and pn_jid.User:
+            return JID(User=pn_jid.User, Server='s.whatsapp.net',
+                       RawAgent=0, Device=0, Integrator=0)
+    except Exception as e:
+        logger.warning(f"Falha ao converter LID {jid_str}: {e}")
+    return _make_jid(jid_str)  # fallback: tenta com @lid mesmo
+```
+
+> Use `_resolve_jid` em `send_image_message` e `send_audio_message`.
+> Em `send_text_message`, use `_make_jid` direto (texto funciona com @lid).
+
+---
+
+## 7. Problemas Comuns e Soluções
+
+### P1 — Áudio entregue mas não aparece no WhatsApp
+
+**Sintoma:** `send_audio OK`, `status='delivered'`, mas o contato não vê nada.
+**Causa:** MIME type `audio/ogg` ao invés de `audio/ogg; codecs=opus`.
+**Fix:**
+```python
+msg = client.build_audio_message(audio_bytes, ptt=True)
+msg.audioMessage.mimetype = 'audio/ogg; codecs=opus'  # ← OBRIGATÓRIO
+result = client.send_message(jid_obj, msg)
+```
+
+---
+
+### P2 — `UploadError: failed to refresh media connections: websocket not connected`
+
+**Sintoma:** erro ao enviar imagem/áudio logo após reconexão.
+**Causa 1:** JID no formato `@lid` (veja P3).
+**Causa 2:** WebSocket reconectou mas as conexões com o CDN do WhatsApp ainda não estão prontas.
+**Fix:** verificar `client.is_connected` antes de enviar mídia. **NÃO adicionar loops de retry com `time.sleep()`** — isso acumula threads e derruba o servidor.
+
+```python
+if not client.is_connected:
+    logger.error("WebSocket não conectado")
+    return ''
+# só então tenta o upload
+```
+
+---
+
+### P3 — Mídia falha para contatos com JID `@lid`
+
+**Sintoma:** texto vai, imagem/áudio retornam `UploadError`.
+**Causa:** JID no formato Local ID (Meta Privacy) não suporta upload direto.
+**Fix:** use `_resolve_jid()` que converte via `client.get_pn_from_lid()`.
+
+---
+
+### P4 — Servidor trava, load average 40+, RAM 100%
+
+**Sintoma:** servidor inresponsivo, SSH timeout.
+**Causa:** loops de retry `for _ in range(20): time.sleep(1)` em threads daemon. Com múltiplas mensagens simultâneas, acumula centenas de threads dormindo.
+**Fix:** **NUNCA use retry loops com sleep em threads de envio.** Falhou = retorna `''` e loga. Se precisar de retry, implemente com fila (Celery/Redis).
+
+Deploy de emergência quando o servidor travar:
+```python
+# deploy_urgente.py
+# 1. systemctl stop gunicorn  (mata todas as threads presas)
+# 2. pkill -9 -f gunicorn     (forçado)
+# 3. time.sleep(3)
+# 4. upload dos arquivos corrigidos
+# 5. systemctl start gunicorn
+```
+
+---
+
+### P5 — Mensagem duplicada recebida
+
+**Sintoma:** `MessageHandler` processa a mesma mensagem 2x, cria 2 registros no banco.
+**Causa:** Neonize pode re-entregar mensagens em reconexão.
+**Fix:** deduplicação por `message_id` com dict em memória (cache de 5 min):
+
+```python
+with self._msg_lock:
+    if mid in self._msg_ids:
+        return  # já processou
+    self._msg_ids[mid] = time.time()
+```
+
+---
+
+### P6 — Status de entrega/leitura não atualiza
+
+**Sintoma:** mensagens ficam em `sent` mesmo após o contato ler.
+**Causa:** `ReceiptEv` callback não estava sendo registrado, ou perdido no `_auto_reconnect`.
+**Fix:** garantir que `on_message_status` seja passado tanto na conexão inicial quanto no auto-reconnect:
+
+```python
+# _auto_reconnect dentro do DisconnectedEv handler
+self.connect_instance(
+    iid, inst_obj.get_session_path(),
+    on_message=on_message,
+    on_connected=on_connected,
+    on_disconnected=on_disconnected,
+    on_message_status=on_message_status,  # ← não esquecer este!
+)
+```
+
+---
+
+### P7 — QR code não aparece / timeout na conexão
+
+**Sintoma:** `connect_instance` retorna mas `wait_for_qr()` retorna `None`.
+**Causa:** rate limit de 30s por instância, ou thread ainda não iniciou.
+**Fix:** verificar se não há rate limit ativo. O rate limit existe para evitar spam de reconexão:
+
+```python
+if time.time() - self._last_connect.get(iid, 0) < 30:
+    logger.warning(f"Rate limit atingido: {iid}")
+    return
+```
+
+---
+
+### P8 — `tags field: 'NoneType' object is not iterable`
+
+**Sintoma:** log de warning ao enviar áudio OGG.
+**Causa:** ffprobe no formato OGG não inclui campo `tags` no JSON de saída. Neonize tenta iterar sobre ele.
+**Impacto:** **não crítico** — a mensagem é enviada normalmente. É apenas um warning de log.
+**Fix:** não é necessário; pode suprimir o log se incomodar.
+
+---
+
+### P9 — `RuntimeWarning: Accessing the database during app initialization`
+
+**Sintoma:** warning no Django ao fazer `migrate` ou `manage.py`.
+**Causa:** `startup_reconnect()` faz query no banco dentro do `AppConfig.ready()`.
+**Impacto:** apenas warning, não afeta funcionamento.
+**Fix:** ignorar, ou envolver em `try/except` com `apps.ready()` check.
+
+---
+
+## 8. Deploy com Gunicorn
+
+### Configuração obrigatória
+
+```ini
+# /etc/systemd/system/gunicorn-meuapp.service
+[Service]
+ExecStart=/path/venv/bin/gunicorn \
+    --workers 1 \          ← OBRIGATÓRIO: 1 worker evita duplicação + db lock
+    --bind 127.0.0.1:PORT \
+    --timeout 120 \        ← timeout maior para reconexões longas
+    config.wsgi:application
+```
+
+### Script de deploy padrão
+
+```python
+import paramiko, os
+
+KEY_PATH    = r'C:\Users\...\chave.pem'
+HOST        = '65.108.x.x'
+LOCAL_BASE  = r'C:\xampp\htdocs\meu-projeto'
+REMOTE_BASE = '/home/user/htdocs/meuapp.com'
+
+key = paramiko.RSAKey.from_private_key_file(KEY_PATH)
+ssh = paramiko.SSHClient()
+ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+ssh.connect(HOST, port=22, username='root', pkey=key, timeout=20)
+sftp = ssh.open_sftp()
+
+def run(cmd, timeout=120):
+    _, stdout, stderr = ssh.exec_command(cmd, timeout=timeout)
+    stdout.channel.settimeout(timeout)
+    return stdout.read().decode() + stderr.read().decode()
+
+# Upload dos arquivos modificados
+sftp.put(LOCAL_BASE + '/apps/atendimento/whatsapp_manager.py',
+         REMOTE_BASE + '/apps/atendimento/whatsapp_manager.py')
+
+sftp.close()
+
+# Migrate + collectstatic + restart
+run(f'cd {REMOTE_BASE} && ./venv/bin/python manage.py migrate 2>&1')
+run('systemctl restart gunicorn-meuapp 2>&1')
+ssh.close()
+```
+
+### Script de emergência (servidor travado)
+
+Quando o servidor trava e SSH demora a conectar:
+
+```python
+# Retry de conexão com timeout maior
+for tentativa in range(1, 6):
+    try:
+        ssh.connect(HOST, port=22, username='root', pkey=key,
+                    timeout=60, banner_timeout=60, auth_timeout=60)
+        break
+    except Exception:
+        time.sleep(15)
+
+# Matar Gunicorn ANTES de subir os arquivos
+run('systemctl stop gunicorn-meuapp && pkill -9 -f gunicorn; echo OK', timeout=30)
+time.sleep(3)
+
+# Upload...
+# Restart limpo
+run('systemctl start gunicorn-meuapp')
+```
+
+> **NUNCA use SSH nativo do Windows** — use sempre Paramiko.
+
+---
+
+## 9. Checklist de Nova Implementação
+
+Use esta lista ao criar um novo projeto com Neonize.
+
+### Models obrigatórios
+- [ ] `InstanciaWhatsApp` com campos: `status`, `session_path`, `qr_code` (base64), `is_connected` property
+- [ ] `ContatoWhatsApp` com `jid` (unique por org) e `phone_normalized`
+- [ ] `Conversa` com `last_message_at`, `unread_count`, `status`
+- [ ] `Mensagem` com `message_id` (para dedup), `sender_type`, `status`
+
+### whatsapp_manager.py
+- [ ] Singleton com `threading.Lock()`
+- [ ] Deduplicação de mensagens por `message_id`
+- [ ] `_resolve_jid()` para converter `@lid` → `@s.whatsapp.net`
+- [ ] Verificação `client.is_connected` antes de upload de mídia
+- [ ] `_auto_reconnect` passando TODOS os callbacks (incluindo `on_message_status`)
+- [ ] `startup_reconnect()` com `fcntl.lockf` para 1 worker
+- [ ] **Áudio: `build_audio_message` + patch `mimetype = 'audio/ogg; codecs=opus'`**
+- [ ] **NENHUM loop de retry com `time.sleep()` em threads de envio**
+
+### Views de envio
+- [ ] Converter webm → ogg com ffmpeg antes de enviar áudio
+- [ ] Verificar `is_connected()` antes de enviar mídia
+- [ ] Retornar erro 503 se instância desconectada (não fazer retry infinito)
+
+### Gunicorn
+- [ ] `--workers 1`
+- [ ] `--timeout 120`
+
+### Servidor
+- [ ] `apt install ffmpeg libmagic1`
+- [ ] `pip install neonize==0.3.15.post0`
+- [ ] Diretório `whatsapp_sessions/` com permissões corretas
+
+---
+
+## Referência rápida: campos proto do AudioMessage
+
+```python
+from neonize.proto.waE2E.WAWebProtobufsE2E_pb2 import Message, AudioMessage
+
+msg = Message(audioMessage=AudioMessage(
+    URL=upload.url,
+    directPath=upload.DirectPath,
+    mediaKey=upload.MediaKey,
+    fileSHA256=upload.FileSHA256,
+    fileEncSHA256=upload.FileEncSHA256,
+    fileLength=upload.FileLength,
+    seconds=duration,          # int (duração em segundos)
+    mimetype='audio/ogg; codecs=opus',  # ← sempre hardcode isso
+    PTT=True,                  # True = bolha de voz, False = arquivo de áudio
+))
+```
+
+---
+
+*Documento gerado em Março/2026 — baseado em debug e implementação real em produção.*
